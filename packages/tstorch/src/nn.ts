@@ -48,3 +48,16 @@ export function maxpool2d(input: Tensor, kernel: [number, number]): Tensor {
     const [tiled, newHeight, newWidth] = tile(input, kernel);
     return tiled.max(4).view(batch!, channel!, newHeight, newWidth);
 }
+
+export function softmax(input: Tensor, dim: number): Tensor {
+    const m = input.max(dim);
+    const e = input.sub(m).exp();
+    return e.mul(e.sum(dim).inv());
+}
+
+export function logsoftmax(input: Tensor, dim: number): Tensor {
+    const m = input.max(dim);
+    const shifted = input.sub(m);
+    const logSumExp = shifted.exp().sum(dim).log();
+    return shifted.sub(logSumExp);
+}
