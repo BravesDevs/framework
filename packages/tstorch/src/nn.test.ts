@@ -1,5 +1,5 @@
 import { describe, test, expect } from '@jest/globals';
-import { tile, avgpool2d, maxpool2d } from './nn';
+import { tile, avgpool2d, maxpool2d, softmax, logsoftmax } from './nn';
 import { Tensor } from './tensor';
 
 function assertClose(actual: number, expected: number, tolerance = 1e-5) {
@@ -213,5 +213,87 @@ describe('maxpool2d', () => {
     const out = maxpool2d(t, [2, 2]);
     expect(out.shape).toEqual([1, 1, 1, 1]);
     assertClose(out.get([0, 0, 0, 0]), -1);
+  });
+});
+
+// ============================================================
+// softmax
+// ============================================================
+
+describe('softmax', () => {
+  test('output sums to 1 along dim', () => {
+    const t = Tensor.tensor([[[[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]]]);
+
+    const q = softmax(t, 3);
+    const s = q.sum(3);
+    for (let i = 0; i < 4; i++) {
+      assertClose(s.get([0, 0, i, 0]), 1.0);
+    }
+  });
+
+  test('output sums to 1 along dim=1', () => {
+    const t = Tensor.tensor([[[[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]]]);
+
+    const q = softmax(t, 1);
+    const s = q.sum(1);
+    assertClose(s.get([0, 0, 0, 0]), 1.0);
+  });
+
+  test('all values are non-negative', () => {
+    const t = Tensor.tensor([[-10, -5, 0, 5, 10]]);
+    const q = softmax(t, 1);
+    for (let i = 0; i < 5; i++) {
+      expect(q.get([0, i])).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  test('larger inputs get larger probabilities', () => {
+    const t = Tensor.tensor([[1, 2, 3]]);
+    const q = softmax(t, 1);
+    expect(q.get([0, 2])).toBeGreaterThan(q.get([0, 1]));
+    expect(q.get([0, 1])).toBeGreaterThan(q.get([0, 0]));
+  });
+
+  test('numerically stable with large values', () => {
+    const t = Tensor.tensor([[1000, 1001, 1002]]);
+    const q = softmax(t, 1);
+    const s = q.sum(1);
+    assertClose(s.get([0, 0]), 1.0);
+  });
+});
+
+// ============================================================
+// logsoftmax
+// ============================================================
+
+describe('logsoftmax', () => {
+  test('exp(logsoftmax) equals softmax', () => {
+    const t = Tensor.tensor([[[[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]]]);
+
+    const sm = softmax(t, 3);
+    const lsm = logsoftmax(t, 3).exp();
+
+    for (let i = 0; i < 4; i++) {
+      for (let j = 0; j < 4; j++) {
+        assertClose(sm.get([0, 0, i, j]), lsm.get([0, 0, i, j]));
+      }
+    }
+  });
+
+  test('all values are <= 0', () => {
+    const t = Tensor.tensor([[1, 2, 3]]);
+    const q = logsoftmax(t, 1);
+    for (let i = 0; i < 3; i++) {
+      expect(q.get([0, i])).toBeLessThanOrEqual(1e-7);
+    }
+  });
+
+  test('numerically stable with large values', () => {
+    const t = Tensor.tensor([[1000, 1001, 1002]]);
+    const sm = softmax(t, 1);
+    const lsm = logsoftmax(t, 1).exp();
+    for (let i = 0; i < 3; i++) {
+      assertClose(sm.get([0, i]), lsm.get([0, i]));
+    }
   });
 });
