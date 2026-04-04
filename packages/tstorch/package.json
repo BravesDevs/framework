@@ -2,6 +2,21 @@
   "name": "tstorch",
   "type": "module",
   "version": "0.0.1",
+  "description": "A minimal machine learning library in TypeScript — autograd, tensors, neural network modules, and training utilities inspired by minitorch.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/r-chong/TSTorch.git",
+    "directory": "packages/tstorch"
+  },
+  "keywords": [
+    "machine-learning",
+    "autograd",
+    "tensor",
+    "neural-network",
+    "deep-learning",
+    "typescript"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

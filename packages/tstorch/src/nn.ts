@@ -98,16 +98,29 @@ export class Conv2d extends Module {
 function EmbeddingLookupFn(
     indices: number[][], batch: number, seqLen: number, numEmb: number, embDim: number
 ): typeof TensorFunction {
+    function validateIndices() {
+        for (let b = 0; b < batch; b++) {
+            for (let s = 0; s < seqLen; s++) {
+                const idx = indices[b]![s]!;
+                if (idx < 0 || idx >= numEmb) {
+                    throw new RangeError(
+                        `Embedding index ${idx} out of range [0, ${numEmb}) at position [${b}, ${s}]`
+                    );
+                }
+            }
+        }
+    }
+
     return class EmbeddingLookup extends TensorFunction {
         static forward(ctx: TensorContext, weight: Tensor): Tensor {
+            validateIndices();
             ctx.saveForBackward(weight);
             const wStorage = weight.data.storage;
             const storage = new Float64Array(batch * seqLen * embDim);
             let offset = 0;
             for (let b = 0; b < batch; b++) {
                 for (let s = 0; s < seqLen; s++) {
-                    const idx = indices[b]![s]!;
-                    const wBase = idx * embDim;
+                    const wBase = indices[b]![s]! * embDim;
                     for (let d = 0; d < embDim; d++) {
                         storage[offset++] = wStorage[wBase + d]!;
                     }
@@ -123,8 +136,7 @@ function EmbeddingLookupFn(
             let offset = 0;
             for (let b = 0; b < batch; b++) {
                 for (let s = 0; s < seqLen; s++) {
-                    const idx = indices[b]![s]!;
-                    const wBase = idx * embDim;
+                    const wBase = indices[b]![s]! * embDim;
                     for (let d = 0; d < embDim; d++) {
                         gradWeight[wBase + d] = gradWeight[wBase + d]! + goStorage[offset++]!;
                     }
