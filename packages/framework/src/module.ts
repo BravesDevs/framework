@@ -1,15 +1,4 @@
-/* 
-Modules form a tree that store parameters and other
-submodules. They make up the basis of neural network stacks.
-
-Attributes:
-    modules : Storage of the child modules
-    parameters : Storage of the module's parameters
-    training : Whether the module is in training mode or evaluation mode
-*/
-
 import { Tensor } from "./tensor.js";
-import { Scalar } from "./scalar.js";
 
 export class Module<P extends BaseParameter = BaseParameter> {
     protected _modules: Record<string, Module<P>> = {};
@@ -21,7 +10,7 @@ export class Module<P extends BaseParameter = BaseParameter> {
             set: (target, key: string | symbol, value, receiver) => {
                 if (value instanceof Module) {
                     target._modules[key as string] = value;
-                } 
+                }
                 else if (value instanceof BaseParameter) {
                     target._parameters[key as string] = value as P;
                 }
@@ -47,13 +36,13 @@ export class Module<P extends BaseParameter = BaseParameter> {
 
     namedParameters(): Array<[string, P]> {
         const named: Array<[string, P]> = Object.entries(this._parameters);
-    
+
         for (const [moduleName, module] of Object.entries(this._modules)) {
             for (const [name, param] of module.namedParameters()) {
                 named.push([`${moduleName}.${name}`, param]);
             }
         }
-    
+
         return named;
     }
 
@@ -84,7 +73,6 @@ export class Module<P extends BaseParameter = BaseParameter> {
     }
 }
 
-// Non-generic base class to type Parameter class yet not Module class
 export abstract class BaseParameter {
     name?: string | undefined;
 }
@@ -102,13 +90,10 @@ export class Parameter<T=Tensor> extends BaseParameter {
     }
 
     get grad() {
-        if (this.value instanceof Scalar) {
-            return this.value.derivative ?? 0;
-        }
         if (this.value instanceof Tensor) {
             return this.value.grad;
         }
-        return 0;
+        return null;
     }
 
     update(v: T) {

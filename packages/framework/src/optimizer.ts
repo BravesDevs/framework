@@ -1,14 +1,12 @@
-import { Scalar } from "./scalar.js";
+import { Tensor, native } from "./tensor.js";
 import { Parameter } from "./module.js";
-import { Tensor } from "./tensor.js";
-import { TensorData } from "./tensor_data.js";
 
-export type ParameterValue = Scalar | Tensor;
+export type ParameterValue = Tensor;
 
 export class Optimizer {
-    parameters: Parameter<ParameterValue>[];
+    parameters: Parameter<Tensor>[];
 
-    constructor(parameters: Parameter<ParameterValue>[]) {
+    constructor(parameters: Parameter<Tensor>[]) {
         this.parameters = parameters;
     }
 }
@@ -16,54 +14,55 @@ export class Optimizer {
 export class SGD extends Optimizer {
     lr: number;
 
-    constructor(parameters: Parameter<ParameterValue>[], lr: number = 1.0) {
+    constructor(parameters: Parameter<Tensor>[], lr: number = 1.0) {
         super(parameters);
         this.lr = lr;
     }
 
     zeroGrad() {
-        for (let p of this.parameters) {
-            if (!p.value || typeof p.value !== 'object') {
-                continue;
-            }
-            if ("derivative" in p.value) { 
-                if (p.value.derivative !== null && p.value.derivative !== undefined) {
-                    p.value.derivative = 0;
-                }
-            }
-            if ("grad" in p.value) { 
-                if (p.value.grad !== null && p.value.grad !== undefined) {
-                    p.value.grad = null;
-                }
-            }
-        }
+        const ids = this.parameters.map(p => p.value._id);
+        native.zeroGrad(ids);
     }
 
     step() {
-        for (let p of this.parameters) {
-            if (!p.value || typeof p.value !== 'object') {
-                continue;
-            }
-
-            if (p.value instanceof Tensor) {
-                const rawGrad = p.value.grad;
-                if (rawGrad) {
-                    // Ensure contiguous layout before raw storage access —
-                    // gradients from permute backward etc. may have non-trivial strides.
-                    const grad = rawGrad.contiguous();
-                    const val = p.value.contiguous();
-                    const valStorage = val.data.storage;
-                    const gradStorage = grad.data.storage;
-                    const newStorage = new Float64Array(val.size);
-                    for (let i = 0; i < val.size; i++) {
-                        newStorage[i] = valStorage[i]! - this.lr * gradStorage[i]!;
-                    }
-                    p.update(new Tensor(new TensorData(newStorage, [...val.shape])) as any);
-                }
-            } else if (p.value instanceof Scalar) {
-                const grad = p.value.derivative ?? 0;
-                p.value.data -= this.lr * grad;
-            }
+        // Simple SGD: p = p - lr * grad
+        for (const p of this.parameters) {
+            const grad = p.value.grad;
+            if (!grad) continue;
+            const updated = p.value.sub(grad.mul(this.lr));
+            p.update(updated as any);
         }
+    }
+}
+
+export class Adam extends Optimizer {
+    lr: number;
+    beta1: number;
+    beta2: number;
+    eps: number;
+    weightDecay: number;
+    t: number = 0;
+
+    constructor(
+        parameters: Parameter<Tensor>[],
+        { lr = 6e-4, beta1 = 0.9, beta2 = 0.95, eps = 1e-8, weightDecay = 0 } = {}
+    ) {
+        super(parameters);
+        this.lr = lr;
+        this.beta1 = beta1;
+        this.beta2 = beta2;
+        this.eps = eps;
+        this.weightDecay = weightDecay;
+    }
+
+    zeroGrad() {
+        const ids = this.parameters.map(p => p.value._id);
+        native.zeroGrad(ids);
+    }
+
+    step() {
+        this.t++;
+        const ids = this.parameters.map(p => p.value._id);
+        native.adamwStep(ids, this.lr, this.beta1, this.beta2, this.eps, this.weightDecay, this.t);
     }
 }

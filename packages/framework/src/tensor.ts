@@ -1,418 +1,215 @@
-import type {
-    Shape,
-} from './tensor_data.js'
+import { createRequire } from 'node:module';
+import { existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import {
-    TensorData,
-    shapeProduct,
-} from './tensor_data.js'
-import * as tensorFunctions from './tensor_functions.js'
-import { tensorMap } from './tensor_ops.js'
-import { 
-    TensorContext, 
-    TensorHistory, 
-    TensorFunction,
-    Neg as NegFn,
-    Sigmoid as SigmoidFn,
-    ReLU as ReLUFn,
-    Log as LogFn,
-    Exp as ExpFn,
-    Inv as InvFn,
-    Add as AddFn,
-    Mul as MulFn,
-    LT as LTFn,
-    EQ as EQFn,
-    Sum as SumFn,
-    Permute as PermuteFn,
-    View as ViewFn,
-    Contiguous as ContiguousFn,
-    MatMul as MatMulFn,
-    Conv1d as Conv1dFn,
-    Conv2d as Conv2dFn,
-    Max as MaxFn,
-} from './tensor_functions.js';
-import { backPropagateTensor } from './autodiff.js';
+const __dirname_f = dirname(fileURLToPath(import.meta.url));
 
-export type TensorLike = number | Tensor;
+function loadNative() {
+    const require = createRequire(import.meta.url);
+    const candidates = [
+        join(__dirname_f, '..', 'native', 'mni-framework-native.darwin-arm64.node'),
+        join(__dirname_f, '..', 'native', 'mni-framework-native.linux-x64-gnu.node'),
+        join(__dirname_f, '..', 'native', 'target', 'release', 'libmni_framework_native.dylib'),
+        join(__dirname_f, '..', 'native', 'target', 'release', 'libmni_framework_native.so'),
+    ];
+    for (const p of candidates) {
+        if (existsSync(p)) {
+            return require(p);
+        }
+    }
+    throw new Error(`Native addon not found. Tried: ${candidates.join(', ')}`);
+}
+
+export const native: any = loadNative();
+
+export type Shape = number[];
 
 export class Tensor {
-    private _data: TensorData;
-    grad: Tensor | null = null;
-    history: TensorHistory | null = null;
+    readonly _id: number;
+    private _shape: Shape;
 
-    constructor(data: TensorData, history: TensorHistory | null = null) {
-        this._data = data;
-        this.history = history;
+    constructor(id: number, shape?: Shape) {
+        this._id = id;
+        this._shape = shape ?? native.tensorShape(id).map(Number);
     }
 
-    isLeaf(): boolean {
-        return !this.history?.lastFn;
+    get shape(): Shape { return this._shape; }
+    get size(): number { return this._shape.reduce((a: number, b: number) => a * b, 1); }
+    get dims(): number { return this._shape.length; }
+
+    // Compatibility stubs for old code that accesses .data.storage or .history
+    get data(): { storage: Float32Array } {
+        return { storage: this.toFloat32() };
+    }
+    set history(_v: any) { /* no-op: autograd is in Rust */ }
+    get history(): null { return null; }
+
+    // ---- Gradient ----
+
+    get grad(): Tensor | null {
+        const gid = native.getGrad(this._id);
+        if (gid == null) return null;
+        return new Tensor(gid);
+    }
+    set grad(_v: Tensor | null) { /* managed by Rust */ }
+
+    backward(): void {
+        native.backward(this._id);
     }
 
     requiresGrad(): boolean {
-        return this.history !== null;
+        return native.getGrad(this._id) != null;
     }
 
-    accumulateGrad(grad: Tensor): void {
-        if (this.grad === null) {
-            this.grad = grad;
-        } else {
-            this.grad = this.grad.add(grad);
-        }
-    }
+    // ---- Data transfer ----
 
-    async chainRule(gradOutput: Tensor): Promise<[Tensor, Tensor][]> {
-        const h = this.history;
-        if (!h || !h.lastFn || !h.ctx) {
-            throw new Error("Cannot call chainRule on leaf tensor");
-        }
-
-        const gradientsOrPromise = h.lastFn.backward(h.ctx, gradOutput);
-        const gradients: Tensor[] = gradientsOrPromise instanceof Promise
-            ? await gradientsOrPromise
-            : gradientsOrPromise;
-
-        if (gradients.length !== h.inputs.length) {
-            throw new Error(
-                `Backward returned ${gradients.length} gradients but expected ${h.inputs.length} for ${h.inputs.length} inputs`
-            );
-        }
-
-        const result: [Tensor, Tensor][] = [];
-        for (let i = 0; i < h.inputs.length; i++) {
-            result.push([h.inputs[i]!, gradients[i]!]);
-        }
-        return result;
-    }
-
-    get parents(): Tensor[] {
-        return this.history?.inputs ?? [];
-    }
-
-    static apply(fn: typeof TensorFunction, ...vals: TensorLike[]): Tensor {
-        const tensors: Tensor[] = vals.map(v =>
-            v instanceof Tensor ? v : Tensor.tensor(v)
-        )
-
-        const ctx = new TensorContext();
-        const result = fn.forward(ctx, ...tensors);
-
-        if (result instanceof Promise) {
-            throw new Error('Use Tensor.applyAsync for async TensorFunctions');
-        }
-
-        const history = new TensorHistory(fn, ctx, tensors);
-        result.history = history;
-
-        return result;
-    }
-
-    static async applyAsync(fn: typeof TensorFunction, ...vals: TensorLike[]): Promise<Tensor> {
-        const tensors: Tensor[] = vals.map(v =>
-            v instanceof Tensor ? v : Tensor.tensor(v)
-        )
-
-        const ctx = new TensorContext();
-        const resultOrPromise = fn.forward(ctx, ...tensors);
-        const result = resultOrPromise instanceof Promise
-            ? await resultOrPromise
-            : resultOrPromise;
-
-        const history = new TensorHistory(fn, ctx, tensors);
-        result.history = history;
-
-        return result;
-    }
-
-    async backward(gradOutput?: Tensor): Promise<void> {
-        if (gradOutput == undefined) {
-            gradOutput = Tensor.ones(this.shape);
-        }
-        await backPropagateTensor(this, gradOutput);
-    }
-
-    static tensor(values: any, shape?: Shape): Tensor {
-        if (typeof values === 'number') {
-            const storage = new Float64Array([values]);
-            return new Tensor(new TensorData(storage, []));
-        }
-
-        const { flat, inferredShape } = flattenArray(values);
-        const finalShape = shape ?? inferredShape;
-
-        if (shapeProduct(finalShape) != flat.length) {
-            throw new Error(
-                `Shape is incompatible with flat array size`
-            );
-        }
-
-        const storage = new Float64Array(flat);
-        return new Tensor(new TensorData(storage, finalShape));
-    }
-
-    static zeros(shape: Shape) : Tensor {
-        return new Tensor(TensorData.zeros(shape));
-    }
-
-    static ones(shape: Shape): Tensor {
-        const size = shapeProduct(shape);
-        const storage = new Float64Array(size).fill(1);
-        return new Tensor(new TensorData(storage, shape));
-    }
-
-    static rand(shape: Shape): Tensor {
-        const size = shapeProduct(shape);
-        const storage = new Float64Array(size);
-        for (let i = 0; i < size; i++) {
-            storage[i] = Math.random();
-        }
-        return new Tensor(new TensorData(storage, shape));
-    }
-
-    get size(): number {
-        return this._data.size;
-    }
-
-    get dims(): number {
-        return this._data.dims;
-    }
-
-    get shape(): Shape {
-        return this._data.shape;
-    }
-
-    get data(): TensorData {
-        return this._data;
-    }
-
-    private static _ensureTensor(value: number | Tensor) : Tensor {
-        if (value instanceof Tensor) {
-            return value;
-        }
-
-        return Tensor.tensor(value);
-    }
-
-    neg(): Tensor {
-        return Tensor.apply(NegFn, this);
-    }
-
-    sigmoid(): Tensor {
-        return Tensor.apply(SigmoidFn, this);
-    }
-
-    relu(): Tensor {
-        return Tensor.apply(ReLUFn, this);
-    }
-
-    log(): Tensor {
-        return Tensor.apply(LogFn, this);
-    }
-
-    exp(): Tensor {
-        return Tensor.apply(ExpFn, this);
-    }
-
-    inv(): Tensor {
-        return Tensor.apply(InvFn, this);
-    }
-
-    add(other: number | Tensor): Tensor {
-        return Tensor.apply(AddFn, this, Tensor._ensureTensor(other));
-    }
-
-    sub(other: number | Tensor): Tensor {
-        // a - b = a + (-b)
-        return this.add(Tensor._ensureTensor(other).neg());
-    }
-
-    mul(other: number | Tensor): Tensor {
-        return Tensor.apply(MulFn, this, Tensor._ensureTensor(other));
-    }
-
-    lt(other: number | Tensor): Tensor {
-        return Tensor.apply(LTFn, this, Tensor._ensureTensor(other));
-    }
-
-    eq(other: number | Tensor): Tensor {
-        return Tensor.apply(EQFn, this, Tensor._ensureTensor(other));
-    }
-
-    gt(other: number | Tensor): Tensor {
-        // a > b is equivalent to b < a
-        const b = Tensor._ensureTensor(other);
-        return Tensor.apply(LTFn, b, this);
-    }
-
-    is_close(other: number | Tensor): Tensor {
-        // Note: is_close is a comparison operation and does not support gradients
-        const b = Tensor._ensureTensor(other);
-        return new Tensor(tensorFunctions.isClose(this._data, b._data));
-    }
-
-    radd(other: number | Tensor): Tensor {
-        return this.add(other);
-    }
-
-    rmul(other: number | Tensor): Tensor {
-        return this.mul(other);
-    }
-
-    matmul(other: Tensor): Promise<Tensor> {
-        return Tensor.applyAsync(MatMulFn, this, other);
-    }
-
-    conv1d(weight: Tensor): Tensor {
-        return Tensor.apply(Conv1dFn, this, weight);
-    }
-
-    conv2d(weight: Tensor): Tensor {
-        return Tensor.apply(Conv2dFn, this, weight);
-    }
-
-    sum(dim?: number): Tensor {
-        if (dim === undefined) {
-            if (this.dims === 0) {
-                return this;
-            }
-            let result: Tensor = this;
-            for (let d = result.dims - 1; d >= 0; d--) {
-                result = Tensor.apply(SumFn(d), result);
-            }
-            return result.view();
-        }
-
-        if (dim < 0 || dim >= this.dims) {
-            throw new Error(`Invalid dimension ${dim} for tensor with ${this.dims} dimensions`);
-        }
-
-        return Tensor.apply(SumFn(dim), this);
-    }
-
-    max(dim: number): Tensor {
-        if (dim < 0 || dim >= this.dims) {
-            throw new Error(`Invalid dimension ${dim} for tensor with ${this.dims} dimensions`);
-        }
-        return Tensor.apply(MaxFn(dim), this);
-    }
-
-    mean(dim?: number): Tensor {
-        if (dim === undefined) {
-            const s = this.sum();
-            const count = this.size;
-            return s.mul(1 / count);
-        }
-
-        if (dim < 0 || dim >= this.dims) {
-            throw new Error(`Invalid dimension ${dim} for tensor with ${this.dims} dimensions`);
-        }
-
-        const s = this.sum(dim);
-        const count = this._data.shape[dim]!;
-        return s.mul(1 / count);
-    }
-
-    // Note: all() is a boolean reduction and does not support gradients
-    all(dim?: number): Tensor {
-        if (dim === undefined) {
-            let result = this._data;
-            for (let d = 0; d < result.dims; d++) {
-                result = tensorFunctions.prod(result, d);
-            }
-            const val = result.storage[0]! !== 0 ? 1 : 0;
-            return Tensor.tensor(val);
-        }
-
-        if (dim < 0 || dim >= this.dims) {
-            throw new Error(`Invalid dimension ${dim} for tensor with ${this.dims} dimensions`);
-        }
-
-        const p = tensorFunctions.prod(this._data, dim);
-        const toBoolean = (x: number) => (x !== 0 ? 1 : 0);
-        const out = TensorData.zeros(p.shape);
-        const mapFn = tensorMap(toBoolean);
-        mapFn(out.storage, out.shape, out.strides, p.storage, p.shape, p.strides);
-        return new Tensor(out);
-    }
-
-    permute(...order: number[]): Tensor {
-        return Tensor.apply(PermuteFn(order), this);
-    }
-
-    view(...shape: number[]): Tensor {
-        return Tensor.apply(ViewFn(shape), this);
-    }
-
-    contiguous(): Tensor {
-        return Tensor.apply(ContiguousFn, this);
-    }
-
-    zero_grad_():void {
-        this.grad = null;
-    }
-
-    get(idx: number[]): number {
-        return this._data.get(idx);
-    }
-
-    set(idx: number[], value: number): void {
-        this._data.set(idx, value);
+    toFloat32(): Float32Array {
+        return native.toFloat32(this._id);
     }
 
     item(): number {
-        if (this.size !== 1) {
-            throw new Error('item() only works for tensors with exactly one element');
+        return native.getScalar(this._id);
+    }
+
+    get(indices: number[]): number {
+        const data = this.toFloat32();
+        let flat = 0;
+        let stride = 1;
+        for (let i = this._shape.length - 1; i >= 0; i--) {
+            flat += indices[i] * stride;
+            stride *= this._shape[i];
         }
-        
-        const idx = new Array(this.dims).fill(0);
-        return this._data.get(idx);
+        return data[flat];
     }
 
-    toArray(): any {
-        return buildNestedArray(this._data, 0, new Array(this.dims).fill(0));
+    free(): void {
+        native.freeTensor(this._id);
     }
 
-    toString(): string {
-        if (this.dims === 0) {
-            return `Tensor(${this._data.storage[0]})`;
+    // ---- Creation (static) ----
+
+    static fromFloat32(data: Float32Array, shape: Shape): Tensor {
+        const id = native.fromFloat32(data, shape.map(Number));
+        return new Tensor(id, shape);
+    }
+
+    static zeros(shape: Shape): Tensor {
+        const id = native.zeros(shape.map(Number));
+        return new Tensor(id, shape);
+    }
+
+    static ones(shape: Shape): Tensor {
+        const id = native.ones(shape.map(Number));
+        return new Tensor(id, shape);
+    }
+
+    static rand(shape: Shape): Tensor {
+        const id = native.randTensor(shape.map(Number));
+        return new Tensor(id, shape);
+    }
+
+    static randn(shape: Shape): Tensor {
+        const id = native.randnTensor(shape.map(Number));
+        return new Tensor(id, shape);
+    }
+
+    // ---- Elementwise ops ----
+
+    add(other: Tensor | number): Tensor {
+        if (typeof other === 'number') {
+            const s = Tensor.fromFloat32(new Float32Array([other]), [1]);
+            return new Tensor(native.add(this._id, s._id));
         }
-        return `Tensor(${JSON.stringify(this.toArray())}, shape=[${this.shape.join(', ')}])`;
-    }
-}
-
-function flattenArray(arr: any): { flat: number[]; inferredShape: number[] } {
-    const shape: number[] = [];
-    let current: any = arr;
-    while (Array.isArray(current)) {
-        shape.push(current.length);
-        current = current[0];
+        return new Tensor(native.add(this._id, other._id));
     }
 
-    const flat: number[] = [];
-    flattenRecursive(arr, flat);
-
-    return {flat, inferredShape: shape};
-}
-
-function flattenRecursive(arr: any, out: number[]): void {
-    if (Array.isArray(arr)) {
-        for (const item of arr) {
-            flattenRecursive(item, out);
+    sub(other: Tensor | number): Tensor {
+        if (typeof other === 'number') {
+            const s = Tensor.fromFloat32(new Float32Array([other]), [1]);
+            return new Tensor(native.sub(this._id, s._id));
         }
-    } else {
-        out.push(arr);
-    }
-}
-
-function buildNestedArray(data: TensorData, dim: number, idx: number[]): any {
-    if (dim == data.dims) {
-        return data.get(idx);
+        return new Tensor(native.sub(this._id, other._id));
     }
 
-    const result: any[] = [];
-    for (let i = 0; i < data.shape[dim]!; i++) {
-        idx[dim] = i;
-        result.push(buildNestedArray(data, dim + 1, idx));
+    mul(other: Tensor | number): Tensor {
+        if (typeof other === 'number') {
+            return new Tensor(native.mulScalar(this._id, other));
+        }
+        return new Tensor(native.mul(this._id, other._id));
     }
-    return result;
+
+    neg(): Tensor {
+        return new Tensor(native.neg(this._id));
+    }
+
+    exp(): Tensor {
+        return new Tensor(native.expOp(this._id));
+    }
+
+    log(): Tensor {
+        return new Tensor(native.logOp(this._id));
+    }
+
+    // ---- Activation ----
+
+    relu(): Tensor {
+        return new Tensor(native.relu(this._id));
+    }
+
+    sigmoid(): Tensor {
+        // sigmoid(x) = 1 / (1 + exp(-x))
+        const neg_x = this.neg();
+        const exp_neg = neg_x.exp();
+        const one_plus = exp_neg.add(1.0);
+        const one = Tensor.ones([1]);
+        return new Tensor(native.mul(one._id, one_plus._id)).log().neg().exp();
+    }
+
+    // ---- Reduction ----
+
+    sum(dim: number): Tensor {
+        return new Tensor(native.sumOp(this._id, dim));
+    }
+
+    mean(dim: number): Tensor {
+        return new Tensor(native.meanOp(this._id, dim));
+    }
+
+    max(dim: number): Tensor {
+        return new Tensor(native.maxOp(this._id, dim));
+    }
+
+    // ---- Layout ----
+
+    view(...shape: number[]): Tensor {
+        return new Tensor(native.view(this._id, shape.map(Number)));
+    }
+
+    permute(...dims: number[]): Tensor {
+        return new Tensor(native.permute(this._id, dims.map(Number)));
+    }
+
+    contiguous(): Tensor {
+        return new Tensor(native.contiguous(this._id));
+    }
+
+    // ---- Linear algebra ----
+
+    matmul(other: Tensor): Tensor {
+        return new Tensor(native.matmul(this._id, other._id));
+    }
+
+    // ---- Parameter management ----
+
+    setRequiresGrad(requires: boolean): Tensor {
+        native.setRequiresGrad(this._id, requires);
+        return this;
+    }
+
+    // Conv stubs for API compat
+    conv1d(_weight: Tensor): Tensor { throw new Error('conv1d not implemented in native backend'); }
+    conv2d(_weight: Tensor): Tensor { throw new Error('conv2d not implemented in native backend'); }
 }
+
+export type TensorLike = number | Tensor;

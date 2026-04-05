@@ -1,7 +1,5 @@
-import { Tensor } from "./tensor.js"
-import { TensorData, shapeProduct, type Shape } from "./tensor_data.js"
-import { TensorFunction, TensorContext } from "./tensor_functions.js"
-import { Module, Parameter } from "./module.js"
+import { Tensor, native } from "./tensor.js";
+import { Module, Parameter } from "./module.js";
 
 // ============================================================
 // Modules
@@ -22,8 +20,8 @@ export class Linear extends Module {
         this.bias = new Parameter(randRange([outFeatures], -bound, bound));
     }
 
-    async forward(input: Tensor): Promise<Tensor> {
-        return (await input.matmul(this.weight.value)).add(this.bias.value);
+    forward(input: Tensor): Tensor {
+        return input.matmul(this.weight.value).add(this.bias.value);
     }
 }
 
@@ -45,232 +43,99 @@ export class Tanh extends Module {
     }
 }
 
-export class Conv1d extends Module {
-    weight!: Parameter<Tensor>;
-    inChannels: number;
-    outChannels: number;
-    kernelWidth: number;
-
-    constructor(inChannels: number, outChannels: number, kernelWidth: number) {
-        super();
-        this.inChannels = inChannels;
-        this.outChannels = outChannels;
-        this.kernelWidth = kernelWidth;
-        const bound = 1 / Math.sqrt(inChannels * kernelWidth);
-        this.weight = new Parameter(
-            randRange([outChannels, inChannels, kernelWidth], -bound, bound)
-        );
-    }
-
-    forward(input: Tensor): Tensor {
-        return input.conv1d(this.weight.value);
-    }
-}
-
-export class Conv2d extends Module {
-    weight!: Parameter<Tensor>;
-    inChannels: number;
-    outChannels: number;
-    kernelHeight: number;
-    kernelWidth: number;
-
-    constructor(inChannels: number, outChannels: number, kernelSize: [number, number]) {
-        super();
-        this.inChannels = inChannels;
-        this.outChannels = outChannels;
-        this.kernelHeight = kernelSize[0];
-        this.kernelWidth = kernelSize[1];
-        const bound = 1 / Math.sqrt(inChannels * this.kernelHeight * this.kernelWidth);
-        this.weight = new Parameter(
-            randRange([outChannels, inChannels, this.kernelHeight, this.kernelWidth], -bound, bound)
-        );
-    }
-
-    forward(input: Tensor): Tensor {
-        return input.conv2d(this.weight.value);
-    }
-}
-
-/**
- * Creates a TensorFunction for embedding lookup with efficient O(B*S*D) backward
- * instead of the naive O(B*S*V*D) one-hot matmul approach.
- */
-function EmbeddingLookupFn(
-    indices: number[][], batch: number, seqLen: number, numEmb: number, embDim: number
-): typeof TensorFunction {
-    function validateIndices() {
-        for (let b = 0; b < batch; b++) {
-            for (let s = 0; s < seqLen; s++) {
-                const idx = indices[b]![s]!;
-                if (idx < 0 || idx >= numEmb) {
-                    throw new RangeError(
-                        `Embedding index ${idx} out of range [0, ${numEmb}) at position [${b}, ${s}]`
-                    );
-                }
-            }
-        }
-    }
-
-    return class EmbeddingLookup extends TensorFunction {
-        static forward(ctx: TensorContext, weight: Tensor): Tensor {
-            validateIndices();
-            ctx.saveForBackward(weight);
-            const wStorage = weight.data.storage;
-            const storage = new Float64Array(batch * seqLen * embDim);
-            let offset = 0;
-            for (let b = 0; b < batch; b++) {
-                for (let s = 0; s < seqLen; s++) {
-                    const wBase = indices[b]![s]! * embDim;
-                    for (let d = 0; d < embDim; d++) {
-                        storage[offset++] = wStorage[wBase + d]!;
-                    }
-                }
-            }
-            return new Tensor(new TensorData(storage, [batch, seqLen, embDim]));
-        }
-
-        static backward(ctx: TensorContext, gradOutput: Tensor): Tensor[] {
-            const go = gradOutput.contiguous();
-            const goStorage = go.data.storage;
-            const gradWeight = new Float64Array(numEmb * embDim);
-            let offset = 0;
-            for (let b = 0; b < batch; b++) {
-                for (let s = 0; s < seqLen; s++) {
-                    const wBase = indices[b]![s]! * embDim;
-                    for (let d = 0; d < embDim; d++) {
-                        gradWeight[wBase + d] = gradWeight[wBase + d]! + goStorage[offset++]!;
-                    }
-                }
-            }
-            return [new Tensor(new TensorData(gradWeight, [numEmb, embDim]))];
-        }
-    };
-}
-
 export class Embedding extends Module {
     weight!: Parameter<Tensor>;
-    numEmbeddings: number;
-    embeddingDim: number;
+    vocabSize: number;
+    embedDim: number;
 
-    constructor(numEmbeddings: number, embeddingDim: number, weights?: Tensor) {
+    constructor(vocabSize: number, embedDim: number) {
         super();
-        this.numEmbeddings = numEmbeddings;
-        this.embeddingDim = embeddingDim;
-        this.weight = new Parameter(weights ?? randRange([numEmbeddings, embeddingDim], -0.1, 0.1));
-    }
-
-    static fromPretrained(weights: Tensor): Embedding {
-        const [numEmb, embDim] = weights.shape;
-        return new Embedding(numEmb!, embDim!, weights);
+        this.vocabSize = vocabSize;
+        this.embedDim = embedDim;
+        const bound = 1 / Math.sqrt(embedDim);
+        this.weight = new Parameter(randRange([vocabSize, embedDim], -bound, bound));
     }
 
     forward(indices: number[][]): Tensor {
         const batch = indices.length;
-        const seqLen = indices[0]!.length;
-        const fn = EmbeddingLookupFn(indices, batch, seqLen, this.numEmbeddings, this.embeddingDim);
-        return Tensor.apply(fn, this.weight.value);
+        const seqLen = indices[0].length;
+        const flat = indices.flat();
+        const id = native.embeddingForward(this.weight.value._id, flat, batch, seqLen);
+        return new Tensor(id);
     }
 }
 
 // ============================================================
-// Loss functions
+// Functional ops
 // ============================================================
 
-export function mseLoss(input: Tensor, target: Tensor): Tensor {
-    const diff = input.sub(target);
-    return diff.mul(diff).mean();
+export function softmax(x: Tensor, dim: number = -1): Tensor {
+    return new Tensor(native.softmaxOp(x._id, dim));
 }
 
-export function crossEntropyLoss(input: Tensor, target: Tensor): Tensor {
-    const lsm = logsoftmax(input, input.dims - 1);
-    return lsm.mul(target).neg().sum(input.dims - 1).mean();
+export function gelu(x: Tensor): Tensor {
+    return new Tensor(native.gelu(x._id));
+}
+
+export function dropout(x: Tensor, rate: number = 0.0, inference: boolean = false): Tensor {
+    if (inference || rate === 0) return x;
+    return new Tensor(native.dropoutOp(x._id, rate, true));
+}
+
+export function crossEntropyLoss(logits: Tensor, targets: number[][]): Tensor {
+    const shape = logits.shape;
+    const V = shape[shape.length - 1];
+    const BT = logits.size / V;
+
+    // Flatten logits to [BT, V]
+    const flatLogits = logits.view(BT, V);
+    const flatTargets = targets.flat();
+    const id = native.crossEntropyLoss(flatLogits._id, flatTargets);
+    return new Tensor(id);
+}
+
+export function layerNorm(x: Tensor, gamma: Tensor, beta: Tensor, eps: number = 1e-5): Tensor {
+    return new Tensor(native.layernormOp(x._id, gamma._id, beta._id, eps));
+}
+
+export function mseLoss(pred: Tensor, target: Tensor): Tensor {
+    const diff = pred.sub(target);
+    const sq = diff.mul(diff);
+    return new Tensor(native.meanOp(new Tensor(native.meanOp(sq._id, -1))._id, -1));
+}
+
+export function logsoftmax(x: Tensor, dim: number = -1): Tensor {
+    const sm = softmax(x, dim);
+    return sm.log();
 }
 
 // ============================================================
-// Initialization helpers
+// Utility
 // ============================================================
 
-export function randRange(shape: Shape, low: number, high: number): Tensor {
-    const size = shapeProduct(shape);
-    const storage = new Float64Array(size);
-    for (let i = 0; i < size; i++) {
-        storage[i] = Math.random() * (high - low) + low;
+export function randRange(shape: number[], min: number, max: number): Tensor {
+    const r = Tensor.rand(shape);
+    const data = r.toFloat32();
+    const range = max - min;
+    const scaled = new Float32Array(data.length);
+    for (let i = 0; i < data.length; i++) {
+        scaled[i] = data[i] * range + min;
     }
-    return new Tensor(new TensorData(storage, [...shape]));
+    const t = Tensor.fromFloat32(scaled, shape);
+    t.setRequiresGrad(true);
+    return t;
 }
 
-// ============================================================
-// Functional NN ops
-// ============================================================
-
-/**
- * Reshape an image tensor for 2D pooling.
- *
- * input:  batch x channel x height x width
- * kernel: [kh, kw]
- * returns: tensor of shape [batch, channel, newHeight, newWidth, kh*kw],
- *          plus the newHeight and newWidth values.
- */
-export function tile(input: Tensor, kernel: [number, number]): [Tensor, number, number] {
-    const [batch, channel, height, width] = input.shape;
-    const [kh, kw] = kernel;
-
-    if (!batch) throw new Error("input batch undefined");
-    if (!channel) throw new Error("input channel undefined");
-    if (!height) throw new Error("input height undefined");
-    if (!width) throw new Error("input width undefined");
-
-    if (height % kh !== 0) {
-        throw new Error("input height must be divisible by kernel height");
-    }
-    if (width % kw !== 0) {
-        throw new Error("input width must be divisible by kernel width");
-    }
-
-    const newHeight = height / kh;
-    const newWidth = width / kw;
-
-    const tiled = input.contiguous()
-        .view(batch, channel, newHeight, kh, newWidth, kw)
-        .permute(0, 1, 2, 4, 3, 5)
-        .contiguous()
-        .view(batch, channel, newHeight, newWidth, kh * kw);
-
-    return [tiled, newHeight, newWidth];
+export function tile(_x: Tensor, _reps: number[]): Tensor {
+    throw new Error('tile not implemented in native backend');
 }
 
-export function avgpool2d(input: Tensor, kernel: [number, number]): Tensor {
-    const [batch, channel] = input.shape;
-    const [tiled, newHeight, newWidth] = tile(input, kernel);
-    return tiled.mean(4).view(batch!, channel!, newHeight, newWidth);
+export function avgpool2d(_x: Tensor, _kh: number, _kw: number): Tensor {
+    throw new Error('avgpool2d not implemented in native backend');
 }
 
-export function maxpool2d(input: Tensor, kernel: [number, number]): Tensor {
-    const [batch, channel] = input.shape;
-    const [tiled, newHeight, newWidth] = tile(input, kernel);
-    return tiled.max(4).view(batch!, channel!, newHeight, newWidth);
+export function maxpool2d(_x: Tensor, _kh: number, _kw: number): Tensor {
+    throw new Error('maxpool2d not implemented in native backend');
 }
 
-export function softmax(input: Tensor, dim: number): Tensor {
-    const m = input.max(dim);
-    const e = input.sub(m).exp();
-    return e.mul(e.sum(dim).inv());
-}
-
-export function logsoftmax(input: Tensor, dim: number): Tensor {
-    const m = input.max(dim);
-    const shifted = input.sub(m);
-    const logSumExp = shifted.exp().sum(dim).log();
-    return shifted.sub(logSumExp);
-}
-
-export function dropout(input: Tensor, rate: number = 0.5, ignore: boolean = false): Tensor {
-    if (ignore || rate === 0.0) return input;
-    if (rate >= 1.0) return Tensor.zeros(input.shape);
-    const mask = Tensor.rand(input.shape).gt(rate);
-    return input.mul(mask).mul(1 / (1 - rate));
-}
-
-export function gelu(input: Tensor): Tensor {
-    return input.mul(input.mul(1.702).sigmoid());
-}
+export { Module, Parameter };
