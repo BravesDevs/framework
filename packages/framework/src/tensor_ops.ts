@@ -34,6 +34,22 @@ async function getGpuMatMul(): Promise<GpuMatMulFn | null> {
     }
 }
 
+type CudaMatMulFn = typeof import('./cuda_ops.js')['cudaMatMul'];
+let _cudaMatMul: CudaMatMulFn | null | false = null;
+
+async function getCudaMatMul(): Promise<CudaMatMulFn | null> {
+    if (_cudaMatMul === false) return null;
+    if (_cudaMatMul !== null) return _cudaMatMul;
+    try {
+        const mod = await import('./cuda_ops.js');
+        _cudaMatMul = mod.cudaMatMul;
+        return _cudaMatMul;
+    } catch {
+        _cudaMatMul = false;
+        return null;
+    }
+}
+
 export function tensorMap(
     fn: (x: number) => number
 ): (
@@ -282,9 +298,10 @@ export async function tensorMatrixMultiply(A: Tensor, B: Tensor): Promise<Tensor
     const aStrides = computeStrides(aFullShape);
     const bStrides = computeStrides(bFullShape);
 
-    let outStorage: Storage;
-    const gpuFn = await getGpuMatMul();
+    let outStorage: Storage | null = null;
 
+    // 1) Try WebGPU
+    const gpuFn = await getGpuMatMul();
     if (gpuFn) {
         try {
             outStorage = createSharedStorage(outSize);
@@ -295,13 +312,24 @@ export async function tensorMatrixMultiply(A: Tensor, B: Tensor): Promise<Tensor
             );
         } catch {
             _gpuCallFailed = true;
-            outStorage = cpuMatMul(
+            outStorage = null;
+        }
+    }
+
+    // 2) Try CUDA / cuBLAS
+    if (!outStorage) {
+        const cudaFn = await getCudaMatMul();
+        if (cudaFn) {
+            outStorage = await cudaFn(
                 aContig.storage, aBatchDims, M, K,
                 bContig.storage, bBatchDims, N,
                 outBatchDims,
             );
         }
-    } else {
+    }
+
+    // 3) CPU fallback
+    if (!outStorage) {
         outStorage = cpuMatMul(
             aContig.storage, aBatchDims, M, K,
             bContig.storage, bBatchDims, N,

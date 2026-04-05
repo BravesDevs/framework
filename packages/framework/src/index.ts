@@ -27,6 +27,12 @@ export async function destroyDevice(): Promise<void> {
     } catch {
         // webgpu not available on this platform
     }
+    try {
+        const mod = await import('./cuda_ops.js');
+        await mod.destroyCuda();
+    } catch {
+        // cuda not available on this platform
+    }
 }
 
 // Neural network layers and functions
