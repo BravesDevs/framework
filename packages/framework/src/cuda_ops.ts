@@ -4,15 +4,22 @@
  * Dynamically loads libcudart and libcublas at runtime — fails gracefully
  * if CUDA is not available (no GPU, no toolkit, etc.).
  *
- * All data is converted Float64 → Float32 for cuBLAS sgemm and back.
+ * Features:
+ *  - Device buffer pooling (reuses cudaMalloc buffers across calls)
+ *  - cublasSgemmStridedBatched for non-broadcast batched matmuls
+ *  - Float64 → Float32 conversion for cuBLAS, Float32 → Float64 back
  */
 
 import type { Storage } from './tensor_data.js';
 import { createSharedStorage, shapeProduct } from './tensor_data.js';
 
 /* ------------------------------------------------------------------ */
-/*  State                                                              */
+/*  Types & State                                                      */
 /* ------------------------------------------------------------------ */
+
+interface KoffiLib {
+    func(sig: string): (...args: unknown[]) => unknown;
+}
 
 let _initialized = false;
 let _initFailed  = false;
@@ -28,19 +35,57 @@ let _cublasSgemm: (
     B: unknown, ldb: number,
     beta: Float32Array, C: unknown, ldc: number,
 ) => number;
+let _cublasSgemmStridedBatched: (
+    handle: unknown,
+    transa: number, transb: number,
+    m: number, n: number, k: number,
+    alpha: Float32Array, A: unknown, lda: number, strideA: number,
+    B: unknown, ldb: number, strideB: number,
+    beta: Float32Array, C: unknown, ldc: number, strideC: number,
+    batchCount: number,
+) => number;
 let _cublasHandle: unknown;
+let _cublasDestroy: ((handle: unknown) => number) | null = null;
 
 const CUBLAS_OP_N = 0;
 const H2D = 1;
 const D2H = 2;
 
 /* ------------------------------------------------------------------ */
-/*  Init                                                               */
+/*  Device Buffer Pool                                                 */
 /* ------------------------------------------------------------------ */
 
-interface KoffiLib {
-    func(sig: string): (...args: unknown[]) => unknown;
+const _bufferPool = new Map<number, unknown[]>();
+
+function poolAlloc(bytes: number): unknown {
+    const bucket = _bufferPool.get(bytes);
+    if (bucket && bucket.length > 0) {
+        return bucket.pop()!;
+    }
+    const out: [unknown] = [null];
+    _cudaMalloc(out, bytes);
+    return out[0];
 }
+
+function poolRelease(ptr: unknown, bytes: number): void {
+    let bucket = _bufferPool.get(bytes);
+    if (!bucket) {
+        bucket = [];
+        _bufferPool.set(bytes, bucket);
+    }
+    bucket.push(ptr);
+}
+
+function poolFreeAll(): void {
+    for (const [, bucket] of _bufferPool) {
+        for (const ptr of bucket) _cudaFree(ptr);
+    }
+    _bufferPool.clear();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Init                                                               */
+/* ------------------------------------------------------------------ */
 
 function tryLoad(koffi: { load: (name: string) => KoffiLib }, ...names: string[]): KoffiLib {
     for (const name of names) {
@@ -77,6 +122,17 @@ async function initCuda(): Promise<boolean> {
             'void *B, int ldb, ' +
             'const float *beta, void *C, int ldc)',
         ) as typeof _cublasSgemm;
+        _cublasSgemmStridedBatched = cublas.func(
+            'int cublasSgemmStridedBatched(void *handle, int transa, int transb, ' +
+            'int m, int n, int k, ' +
+            'const float *alpha, void *A, int lda, long long strideA, ' +
+            'void *B, int ldb, long long strideB, ' +
+            'const float *beta, void *C, int ldc, long long strideC, ' +
+            'int batchCount)',
+        ) as typeof _cublasSgemmStridedBatched;
+        _cublasDestroy = cublas.func(
+            'int cublasDestroy_v2(void *handle)',
+        ) as (handle: unknown) => number;
 
         const handleOut: [unknown] = [null];
         const status = cublasCreate(handleOut);
@@ -104,38 +160,6 @@ async function initCuda(): Promise<boolean> {
 const _alpha = new Float32Array([1.0]);
 const _beta  = new Float32Array([0.0]);
 
-/**
- * Row-major C = A·B  (A is MxK, B is KxN, C is MxN).
- * cuBLAS is column-major, so we compute  C^T = B^T · A^T
- * which means: cublasSgemm(N, M, K, B, N, A, K, C, N).
- *
- * dA / dB / dC are pre-allocated device pointers.
- */
-function sgemm(
-    M: number, K: number, N: number,
-    aHost: Float32Array, bHost: Float32Array,
-    dA: unknown, dB: unknown, dC: unknown,
-    cHost: Float32Array,
-): void {
-    _cudaMemcpy(dA, aHost, aHost.byteLength, H2D);
-    _cudaMemcpy(dB, bHost, bHost.byteLength, H2D);
-
-    _cublasSgemm(
-        _cublasHandle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
-        N, M, K,
-        _alpha, dB, N,
-        dA, K,
-        _beta, dC, N,
-    );
-
-    _cudaMemcpy(cHost, dC, cHost.byteLength, D2H);
-}
-
-/**
- * Map a flat output-batch ordinal to the corresponding input-batch
- * ordinal, respecting broadcasting rules.
- */
 function batchIndex(
     outBatch: number,
     outBatchDims: number[],
@@ -162,17 +186,18 @@ function batchIndex(
     return inputOrdinal;
 }
 
+function dimsEqual(a: number[], b: number[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Public API                                                         */
 /* ------------------------------------------------------------------ */
 
-/**
- * GPU matrix multiply via cuBLAS.
- *
- * Same interface as `cpuMatMul` in tensor_ops.ts.
- * Returns `null` when CUDA is not available so the caller can fall
- * back to the CPU path.
- */
 export async function cudaMatMul(
     aStorage: Storage,  aBatchDims: number[], M: number, K: number,
     bStorage: Storage,  bBatchDims: number[], N: number,
@@ -192,14 +217,53 @@ export async function cudaMatMul(
     const aF32 = new Float32Array(aStorage);
     const bF32 = new Float32Array(bStorage);
 
-    const dA: [unknown] = [null];
-    const dB: [unknown] = [null];
-    const dC: [unknown] = [null];
-    _cudaMalloc(dA, aMK * 4);
-    _cudaMalloc(dB, bKN * 4);
-    _cudaMalloc(dC, outMN * 4);
+    const canStridedBatch = outBatchSize > 1 && dimsEqual(aBatchDims, bBatchDims)
+                            && dimsEqual(aBatchDims, outBatchDims);
 
-    try {
+    if (canStridedBatch) {
+        // Upload all batch data at once, one strided batched GEMM call
+        const totalABytes = outBatchSize * aMK * 4;
+        const totalBBytes = outBatchSize * bKN * 4;
+        const totalCBytes = outBatchSize * outMN * 4;
+
+        const dA = poolAlloc(totalABytes);
+        const dB = poolAlloc(totalBBytes);
+        const dC = poolAlloc(totalCBytes);
+
+        _cudaMemcpy(dA, aF32, totalABytes, H2D);
+        _cudaMemcpy(dB, bF32, totalBBytes, H2D);
+
+        // Row-major trick: C^T = B^T · A^T
+        _cublasSgemmStridedBatched(
+            _cublasHandle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            N, M, K,
+            _alpha, dB, N, bKN,
+            dA, K, aMK,
+            _beta, dC, N, outMN,
+            outBatchSize,
+        );
+
+        const cF32 = new Float32Array(outSize);
+        _cudaMemcpy(cF32, dC, totalCBytes, D2H);
+
+        for (let i = 0; i < outSize; i++) {
+            outStorage[i] = cF32[i]!;
+        }
+
+        poolRelease(dA, totalABytes);
+        poolRelease(dB, totalBBytes);
+        poolRelease(dC, totalCBytes);
+    } else {
+        // Per-batch fallback (handles broadcasting)
+        const aBytes = aMK * 4;
+        const bBytes = bKN * 4;
+        const cBytes = outMN * 4;
+
+        const dA = poolAlloc(aBytes);
+        const dB = poolAlloc(bBytes);
+        const dC = poolAlloc(cBytes);
+
         const cBuf = new Float32Array(outMN);
 
         for (let batch = 0; batch < outBatchSize; batch++) {
@@ -209,40 +273,44 @@ export async function cudaMatMul(
             const aOff = aBatch * aMK;
             const bOff = bBatch * bKN;
 
-            sgemm(
-                M, K, N,
-                aF32.subarray(aOff, aOff + aMK),
-                bF32.subarray(bOff, bOff + bKN),
-                dA[0], dB[0], dC[0],
-                cBuf,
+            const aSub = aF32.subarray(aOff, aOff + aMK);
+            const bSub = bF32.subarray(bOff, bOff + bKN);
+
+            _cudaMemcpy(dA, aSub, aBytes, H2D);
+            _cudaMemcpy(dB, bSub, bBytes, H2D);
+
+            _cublasSgemm(
+                _cublasHandle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                N, M, K,
+                _alpha, dB, N,
+                dA, K,
+                _beta, dC, N,
             );
+
+            _cudaMemcpy(cBuf, dC, cBytes, D2H);
 
             const outOff = batch * outMN;
             for (let i = 0; i < outMN; i++) {
                 outStorage[outOff + i] = cBuf[i]!;
             }
         }
-    } finally {
-        _cudaFree(dA[0]);
-        _cudaFree(dB[0]);
-        _cudaFree(dC[0]);
+
+        poolRelease(dA, aBytes);
+        poolRelease(dB, bBytes);
+        poolRelease(dC, cBytes);
     }
 
     return outStorage;
 }
 
-let _cublasDestroy: ((handle: unknown) => number) | null = null;
-
 export async function destroyCuda(): Promise<void> {
     if (!_initialized || !_cublasHandle) return;
     try {
-        if (!_cublasDestroy) {
-            const koffi = (await import('koffi')).default;
-            const cublas = tryLoad(koffi, 'libcublas.so', 'libcublas.so.12');
-            _cublasDestroy = cublas.func('int cublasDestroy_v2(void *handle)') as
-                (handle: unknown) => number;
+        poolFreeAll();
+        if (_cublasDestroy) {
+            _cublasDestroy(_cublasHandle);
         }
-        _cublasDestroy(_cublasHandle);
         _cublasHandle = null;
         _initialized = false;
     } catch { /* ignore */ }
