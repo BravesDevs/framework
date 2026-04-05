@@ -38,6 +38,17 @@ const D2H = 2;
 /*  Init                                                               */
 /* ------------------------------------------------------------------ */
 
+interface KoffiLib {
+    func(sig: string): (...args: unknown[]) => unknown;
+}
+
+function tryLoad(koffi: { load: (name: string) => KoffiLib }, ...names: string[]): KoffiLib {
+    for (const name of names) {
+        try { return koffi.load(name); } catch { /* try next */ }
+    }
+    throw new Error(`Could not load any of: ${names.join(', ')}`);
+}
+
 async function initCuda(): Promise<boolean> {
     if (_initFailed)  return false;
     if (_initialized) return true;
@@ -45,27 +56,27 @@ async function initCuda(): Promise<boolean> {
     try {
         const koffi = (await import('koffi')).default;
 
-        const cudart = koffi.load('libcudart.so');
-        const cublas = koffi.load('libcublas.so');
+        const cudart = tryLoad(koffi, 'libcudart.so', 'libcudart.so.12');
+        const cublas = tryLoad(koffi, 'libcublas.so', 'libcublas.so.12');
 
         _cudaMalloc = cudart.func(
             'int cudaMalloc(_Out_ void **devPtr, size_t size)',
-        );
-        _cudaFree = cudart.func('int cudaFree(void *devPtr)');
+        ) as typeof _cudaMalloc;
+        _cudaFree = cudart.func('int cudaFree(void *devPtr)') as typeof _cudaFree;
         _cudaMemcpy = cudart.func(
             'int cudaMemcpy(void *dst, const void *src, size_t count, int kind)',
-        );
+        ) as typeof _cudaMemcpy;
 
         const cublasCreate = cublas.func(
             'int cublasCreate_v2(_Out_ void **handle)',
-        );
+        ) as (out: [unknown]) => number;
         _cublasSgemm = cublas.func(
             'int cublasSgemm_v2(void *handle, int transa, int transb, ' +
             'int m, int n, int k, ' +
             'const float *alpha, void *A, int lda, ' +
             'void *B, int ldb, ' +
             'const float *beta, void *C, int ldc)',
-        );
+        ) as typeof _cublasSgemm;
 
         const handleOut: [unknown] = [null];
         const status = cublasCreate(handleOut);
@@ -220,15 +231,18 @@ export async function cudaMatMul(
     return outStorage;
 }
 
+let _cublasDestroy: ((handle: unknown) => number) | null = null;
+
 export async function destroyCuda(): Promise<void> {
     if (!_initialized || !_cublasHandle) return;
     try {
-        const koffi = (await import('koffi')).default;
-        const cublas = koffi.load('libcublas.so');
-        const cublasDestroy = cublas.func(
-            'int cublasDestroy_v2(void *handle)',
-        );
-        cublasDestroy(_cublasHandle);
+        if (!_cublasDestroy) {
+            const koffi = (await import('koffi')).default;
+            const cublas = tryLoad(koffi, 'libcublas.so', 'libcublas.so.12');
+            _cublasDestroy = cublas.func('int cublasDestroy_v2(void *handle)') as
+                (handle: unknown) => number;
+        }
+        _cublasDestroy(_cublasHandle);
         _cublasHandle = null;
         _initialized = false;
     } catch { /* ignore */ }
