@@ -48,7 +48,7 @@ pub fn sum(a: TensorId, dim: i32, store: &mut TensorStore, tape: &mut Tape) -> T
 #[cfg(feature = "cuda")]
 pub fn sum(a: TensorId, dim: i32, store: &mut TensorStore, tape: &mut Tape) -> TensorId {
     use crate::device::GpuDevice;
-    use cudarc::driver::LaunchConfig;
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
 
     let a_shape = store.shape(a).to_vec();
     let d = resolve_dim(dim, a_shape.len());
@@ -120,7 +120,7 @@ pub fn sum_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStor
 #[cfg(feature = "cuda")]
 pub fn sum_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStore) -> Vec<Option<TensorId>> {
     use crate::device::GpuDevice;
-    use cudarc::driver::LaunchConfig;
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
 
     if let SavedContext::TensorAndShape(_, orig_shape) = saved {
         let grad_shape = store.shape(grad).to_vec();
@@ -186,7 +186,7 @@ pub fn mean(a: TensorId, dim: i32, store: &mut TensorStore, tape: &mut Tape) -> 
 #[cfg(feature = "cuda")]
 pub fn mean(a: TensorId, dim: i32, store: &mut TensorStore, tape: &mut Tape) -> TensorId {
     use crate::device::GpuDevice;
-    use cudarc::driver::LaunchConfig;
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
 
     let a_shape = store.shape(a).to_vec();
     let d = resolve_dim(dim, a_shape.len());
@@ -265,7 +265,7 @@ pub fn mean_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorSto
 #[cfg(feature = "cuda")]
 pub fn mean_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStore) -> Vec<Option<TensorId>> {
     use crate::device::GpuDevice;
-    use cudarc::driver::LaunchConfig;
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
 
     if let SavedContext::TensorAndShape(_, orig_shape) = saved {
         let grad_shape = store.shape(grad).to_vec();
@@ -370,7 +370,7 @@ pub fn max(a: TensorId, dim: i32, store: &mut TensorStore, tape: &mut Tape) -> T
 #[cfg(feature = "cuda")]
 pub fn max(a: TensorId, dim: i32, store: &mut TensorStore, tape: &mut Tape) -> TensorId {
     use crate::device::GpuDevice;
-    use cudarc::driver::LaunchConfig;
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
 
     let a_shape = store.shape(a).to_vec();
     let d = resolve_dim(dim, a_shape.len());

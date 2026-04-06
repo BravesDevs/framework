@@ -1,11 +1,69 @@
 use smallvec::smallvec;
 use crate::autograd::{BackwardOp, SavedContext, Tape, TapeEntry};
-use crate::tensor::{TensorId, TensorStore, compute_strides, shape_size};
+use crate::tensor::{TensorId, TensorStore, compute_strides};
+
+#[cfg(feature = "cuda")]
+use crate::device::GpuDevice;
+#[cfg(feature = "cuda")]
+use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+#[cfg(feature = "cuda")]
+fn launch_cfg(n: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((n + 255) / 256, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Launch the `permute_f32` kernel on the GPU.
+/// `dims` maps output dimension d to source dimension dims[d].
+/// Both `src_id` and `out_id` must be contiguous; `src_shape` is the shape of the source.
+#[cfg(feature = "cuda")]
+fn launch_permute(
+    src_id: TensorId,
+    out_id: TensorId,
+    dims: &[usize],
+    src_shape: &[usize],
+    store: &TensorStore,
+) {
+    let ndim = dims.len();
+    let size = store.size(out_id);
+    let src_strides = compute_strides(src_shape);
+    let out_shape = store.shape(out_id);
+    let dst_strides = compute_strides(out_shape);
+
+    let mut ds = [1i32; 4];
+    let mut es = [0i32; 4];
+    for d in 0..ndim.min(4) {
+        ds[d] = dst_strides[d] as i32;
+        es[d] = src_strides[dims[d]] as i32;
+    }
+
+    let dev = GpuDevice::instance();
+    let func = dev.get_func("permute_f32");
+    let src_ptr = store.dev_ptr(src_id);
+    let out_ptr = store.dev_ptr(out_id);
+    let n = size as i32;
+    let nd = ndim as i32;
+    unsafe {
+        dev.stream.launch_builder(func)
+            .arg(&out_ptr)
+            .arg(&src_ptr)
+            .arg(&n)
+            .arg(&ds[0]).arg(&ds[1]).arg(&ds[2]).arg(&ds[3])
+            .arg(&es[0]).arg(&es[1]).arg(&es[2]).arg(&es[3])
+            .arg(&nd)
+            .launch(launch_cfg(size as u32))
+            .unwrap();
+    }
+}
 
 // =========================================================================
-// View (same for CPU and CUDA — uses to_host / from_vec)
+// View
 // =========================================================================
 
+#[cfg(feature = "cpu")]
 pub fn view(a: TensorId, new_shape: &[usize], store: &mut TensorStore, tape: &mut Tape) -> TensorId {
     let orig_shape = store.shape(a).to_vec();
     let a_id = store.ensure_contiguous(a);
@@ -18,10 +76,31 @@ pub fn view(a: TensorId, new_shape: &[usize], store: &mut TensorStore, tape: &mu
     out
 }
 
+#[cfg(feature = "cuda")]
+pub fn view(a: TensorId, new_shape: &[usize], store: &mut TensorStore, tape: &mut Tape) -> TensorId {
+    let orig_shape = store.shape(a).to_vec();
+    let a_id = store.ensure_contiguous(a);
+    let out = store.clone_device(a_id, new_shape);
+    tape.record(TapeEntry {
+        op: BackwardOp::View, output_id: out, input_ids: smallvec![a],
+        saved: SavedContext::Shape(orig_shape),
+    });
+    out
+}
+
+#[cfg(feature = "cpu")]
 pub fn view_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStore) -> Vec<Option<TensorId>> {
     if let SavedContext::Shape(orig_shape) = saved {
         let data = store.to_host(grad);
         vec![Some(store.from_vec(data, orig_shape))]
+    } else { vec![None] }
+}
+
+#[cfg(feature = "cuda")]
+pub fn view_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStore) -> Vec<Option<TensorId>> {
+    if let SavedContext::Shape(orig_shape) = saved {
+        let g = store.ensure_contiguous(grad);
+        vec![Some(store.clone_device(g, orig_shape))]
     } else { vec![None] }
 }
 
@@ -54,52 +133,33 @@ pub fn permute(a: TensorId, dims: &[usize], store: &mut TensorStore, tape: &mut 
     out
 }
 
-/// CUDA permute: physically rearrange data so the result is always contiguous.
+/// CUDA permute: physically rearrange data via `permute_f32` kernel (result is contiguous).
 #[cfg(feature = "cuda")]
 pub fn permute(a: TensorId, dims: &[usize], store: &mut TensorStore, tape: &mut Tape) -> TensorId {
     let a_shape = store.shape(a).to_vec();
     let ndim = a_shape.len();
     let a_id = store.ensure_contiguous(a);
-    let data = store.to_host(a_id);
 
     let mut new_shape = vec![0usize; ndim];
     for i in 0..ndim {
         new_shape[i] = a_shape[dims[i]];
     }
 
-    let mut inv = vec![0usize; ndim];
-    for i in 0..ndim {
-        inv[dims[i]] = i;
-    }
+    let out = store.zeros(&new_shape);
+    launch_permute(a_id, out, dims, &a_shape, store);
 
-    let size = shape_size(&a_shape);
-    let src_strides = compute_strides(&a_shape);
-    let dst_strides = compute_strides(&new_shape);
-
-    let mut out = vec![0.0f32; size];
-    for i in 0..size {
-        let mut rem = i;
-        let mut src_idx = 0usize;
-        for d in 0..ndim {
-            let coord = rem / dst_strides[d];
-            rem %= dst_strides[d];
-            src_idx += coord * src_strides[inv[d]];
-        }
-        out[i] = data[src_idx];
-    }
-
-    let out_id = store.from_vec(out, &new_shape);
     tape.record(TapeEntry {
-        op: BackwardOp::Permute, output_id: out_id, input_ids: smallvec![a],
+        op: BackwardOp::Permute, output_id: out, input_ids: smallvec![a],
         saved: SavedContext::Permutation(dims.to_vec(), a_shape),
     });
-    out_id
+    out
 }
 
 // =========================================================================
-// Permute backward (same for CPU and CUDA — does a full data copy)
+// Permute backward
 // =========================================================================
 
+#[cfg(feature = "cpu")]
 pub fn permute_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStore) -> Vec<Option<TensorId>> {
     if let SavedContext::Permutation(order, orig_shape) = saved {
         let ndim = order.len();
@@ -112,7 +172,7 @@ pub fn permute_backward(grad: TensorId, saved: &SavedContext, store: &mut Tensor
         let grad_shape = store.shape(grad_contig).to_vec();
 
         let src_strides = compute_strides(&grad_shape);
-        let size = shape_size(&grad_shape);
+        let size = crate::tensor::shape_size(&grad_shape);
 
         let mut out = vec![0.0f32; size];
         let out_strides = compute_strides(orig_shape);
@@ -134,8 +194,25 @@ pub fn permute_backward(grad: TensorId, saved: &SavedContext, store: &mut Tensor
     } else { vec![None] }
 }
 
+/// CUDA backward: permute grad with the inverse mapping via `permute_f32` kernel.
+#[cfg(feature = "cuda")]
+pub fn permute_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStore) -> Vec<Option<TensorId>> {
+    if let SavedContext::Permutation(order, orig_shape) = saved {
+        let ndim = order.len();
+        let mut inv = vec![0usize; ndim];
+        for i in 0..ndim {
+            inv[order[i]] = i;
+        }
+        let grad_id = store.ensure_contiguous(grad);
+        let grad_shape = store.shape(grad_id).to_vec();
+        let out = store.zeros(orig_shape);
+        launch_permute(grad_id, out, &inv, &grad_shape, store);
+        vec![Some(out)]
+    } else { vec![None] }
+}
+
 // =========================================================================
-// Contiguous (same for CPU and CUDA)
+// Contiguous
 // =========================================================================
 
 pub fn contiguous(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> TensorId {
@@ -154,7 +231,7 @@ pub fn contiguous_backward(grad: TensorId, _saved: &SavedContext, _store: &mut T
 }
 
 // =========================================================================
-// insert_raw helper — CPU only (CUDA permute produces contiguous tensors)
+// insert_raw helper — CPU only (used by CPU permute for non-contiguous views)
 // =========================================================================
 
 #[cfg(feature = "cpu")]

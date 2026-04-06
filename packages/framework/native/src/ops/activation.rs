@@ -2,6 +2,16 @@ use smallvec::smallvec;
 use crate::autograd::{BackwardOp, SavedContext, Tape, TapeEntry};
 use crate::tensor::{TensorId, TensorStore, shape_size};
 
+#[cfg(feature = "cuda")]
+use crate::device::GpuDevice;
+#[cfg(feature = "cuda")]
+use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+#[cfg(feature = "cuda")]
+fn launch_cfg(n: u32) -> LaunchConfig {
+    LaunchConfig { grid_dim: ((n + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }
+}
+
 #[cfg(feature = "cpu")]
 fn gelu_scalar(x: f32) -> f32 {
     0.5 * x * (1.0 + ((2.0f32 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x * x * x)).tanh())
@@ -35,33 +45,26 @@ pub fn gelu_forward(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Te
 
 #[cfg(feature = "cuda")]
 pub fn gelu_forward(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> TensorId {
-    use crate::device::GpuDevice;
-    use cudarc::driver::LaunchConfig;
-
     let shape = store.shape(a).to_vec();
     let n = shape_size(&shape);
+    let out = store.zeros(&shape);
     let dev = GpuDevice::instance();
+    let out_ptr = store.dev_ptr(out);
     let a_ptr = store.dev_ptr(a);
-    let out_id = store.zeros(&shape);
-    let out_ptr = store.dev_ptr(out_id);
     let func = dev.get_func("gelu_forward_f32");
     unsafe {
         dev.stream.launch_builder(func)
             .arg(&out_ptr)
             .arg(&a_ptr)
             .arg(&(n as i32))
-            .launch(LaunchConfig {
-                grid_dim: ((n as u32 + 255) / 256, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
+            .launch(launch_cfg(n as u32))
             .unwrap();
     }
     tape.record(TapeEntry {
-        op: BackwardOp::Gelu, output_id: out_id, input_ids: smallvec![a],
+        op: BackwardOp::Gelu, output_id: out, input_ids: smallvec![a],
         saved: SavedContext::Tensor(a),
     });
-    out_id
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -82,32 +85,25 @@ pub fn gelu_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorSto
 
 #[cfg(feature = "cuda")]
 pub fn gelu_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStore) -> Vec<Option<TensorId>> {
-    use crate::device::GpuDevice;
-    use cudarc::driver::LaunchConfig;
-
     if let SavedContext::Tensor(inp) = saved {
         let shape = store.shape(grad).to_vec();
         let n = shape_size(&shape);
+        let out = store.zeros(&shape);
         let dev = GpuDevice::instance();
+        let out_ptr = store.dev_ptr(out);
         let grad_ptr = store.dev_ptr(grad);
         let inp_ptr = store.dev_ptr(*inp);
-        let dx_id = store.zeros(&shape);
-        let dx_ptr = store.dev_ptr(dx_id);
         let func = dev.get_func("gelu_backward_f32");
         unsafe {
             dev.stream.launch_builder(func)
-                .arg(&dx_ptr)
+                .arg(&out_ptr)
                 .arg(&grad_ptr)
                 .arg(&inp_ptr)
                 .arg(&(n as i32))
-                .launch(LaunchConfig {
-                    grid_dim: ((n as u32 + 255) / 256, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
+                .launch(launch_cfg(n as u32))
                 .unwrap();
         }
-        vec![Some(dx_id)]
+        vec![Some(out)]
     } else { vec![None] }
 }
 
@@ -129,33 +125,26 @@ pub fn relu_forward(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Te
 
 #[cfg(feature = "cuda")]
 pub fn relu_forward(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> TensorId {
-    use crate::device::GpuDevice;
-    use cudarc::driver::LaunchConfig;
-
     let shape = store.shape(a).to_vec();
     let n = shape_size(&shape);
+    let out = store.zeros(&shape);
     let dev = GpuDevice::instance();
+    let out_ptr = store.dev_ptr(out);
     let a_ptr = store.dev_ptr(a);
-    let out_id = store.zeros(&shape);
-    let out_ptr = store.dev_ptr(out_id);
     let func = dev.get_func("relu_forward_f32");
     unsafe {
         dev.stream.launch_builder(func)
             .arg(&out_ptr)
             .arg(&a_ptr)
             .arg(&(n as i32))
-            .launch(LaunchConfig {
-                grid_dim: ((n as u32 + 255) / 256, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            })
+            .launch(launch_cfg(n as u32))
             .unwrap();
     }
     tape.record(TapeEntry {
-        op: BackwardOp::Relu, output_id: out_id, input_ids: smallvec![a],
+        op: BackwardOp::Relu, output_id: out, input_ids: smallvec![a],
         saved: SavedContext::Tensor(a),
     });
-    out_id
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -176,31 +165,24 @@ pub fn relu_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorSto
 
 #[cfg(feature = "cuda")]
 pub fn relu_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStore) -> Vec<Option<TensorId>> {
-    use crate::device::GpuDevice;
-    use cudarc::driver::LaunchConfig;
-
     if let SavedContext::Tensor(inp) = saved {
         let shape = store.shape(grad).to_vec();
         let n = shape_size(&shape);
+        let out = store.zeros(&shape);
         let dev = GpuDevice::instance();
+        let out_ptr = store.dev_ptr(out);
         let grad_ptr = store.dev_ptr(grad);
         let inp_ptr = store.dev_ptr(*inp);
-        let dx_id = store.zeros(&shape);
-        let dx_ptr = store.dev_ptr(dx_id);
         let func = dev.get_func("relu_backward_f32");
         unsafe {
             dev.stream.launch_builder(func)
-                .arg(&dx_ptr)
+                .arg(&out_ptr)
                 .arg(&grad_ptr)
                 .arg(&inp_ptr)
                 .arg(&(n as i32))
-                .launch(LaunchConfig {
-                    grid_dim: ((n as u32 + 255) / 256, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })
+                .launch(launch_cfg(n as u32))
                 .unwrap();
         }
-        vec![Some(dx_id)]
+        vec![Some(out)]
     } else { vec![None] }
 }

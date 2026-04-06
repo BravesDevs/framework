@@ -6,7 +6,7 @@ use crate::tensor::{TensorId, TensorStore};
 #[cfg(feature = "cuda")]
 use crate::device::GpuDevice;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{DevicePtr, LaunchConfig};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 #[cfg(feature = "cuda")]
 fn launch_cfg(n: u32) -> LaunchConfig {
@@ -73,7 +73,7 @@ pub fn dropout_forward(
     let mask_host: Vec<f32> = (0..size)
         .map(|_| if rng.gen::<f32>() >= rate { 1.0 } else { 0.0 })
         .collect();
-    let mask_id = store.from_vec(mask_host, &shape);
+    let mask_id = store.from_slice(&mask_host, &shape);
 
     let dev = GpuDevice::instance();
     let x_ptr = store.dev_ptr(x);

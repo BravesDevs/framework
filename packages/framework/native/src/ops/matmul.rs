@@ -3,13 +3,15 @@ use crate::autograd::{BackwardOp, SavedContext, Tape, TapeEntry};
 use crate::tensor::{TensorId, TensorStore, shape_size};
 
 #[cfg(feature = "cuda")]
+use crate::tensor::compute_strides;
+#[cfg(feature = "cuda")]
 use crate::device::GpuDevice;
 #[cfg(feature = "cuda")]
-use cudarc::cublas::{GemmConfig, StridedBatchedConfig};
-#[cfg(feature = "cuda")]
-use cudarc::cublas::safe::Gemm;
+use cudarc::cublas::safe::{GemmConfig, StridedBatchedConfig, Gemm};
 #[cfg(feature = "cuda")]
 use cudarc::cublas::sys::cublasOperation_t;
+#[cfg(feature = "cuda")]
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 /// CPU matmul supporting batched dimensions.
 /// A: [..., M, K], B: [..., K, N] → C: [..., M, N]
@@ -194,13 +196,13 @@ pub fn matmul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape
     out_id
 }
 
+#[cfg(feature = "cpu")]
 pub fn matmul_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStore) -> Vec<Option<TensorId>> {
     if let SavedContext::Tensors(ids) = saved {
         let a = ids[0]; let b = ids[1];
         let a_shape = store.shape(a).to_vec();
         let b_shape = store.shape(b).to_vec();
 
-        // grad_a = grad @ B^T
         let b_t = transpose_last2(b, store);
         let grad_a = matmul_no_grad(grad, b_t, store);
         let grad_a_data = store.to_host(grad_a);
@@ -208,7 +210,6 @@ pub fn matmul_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorS
         let ga = crate::utils::unbroadcast(&grad_a_data, &grad_a_shape, &a_shape);
         let ga_id = store.from_vec(ga, &a_shape);
 
-        // grad_b = A^T @ grad
         let a_t = transpose_last2(a, store);
         let grad_b = matmul_no_grad(a_t, grad, store);
         let grad_b_data = store.to_host(grad_b);
@@ -220,8 +221,41 @@ pub fn matmul_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorS
     } else { vec![None, None] }
 }
 
-/// Transpose the last two dimensions. Works on both CPU and CUDA via the
-/// polymorphic `to_host` / `from_vec` methods on `TensorStore`.
+#[cfg(feature = "cuda")]
+pub fn matmul_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStore) -> Vec<Option<TensorId>> {
+    if let SavedContext::Tensors(ids) = saved {
+        let a = ids[0]; let b = ids[1];
+        let a_shape = store.shape(a).to_vec();
+        let b_shape = store.shape(b).to_vec();
+
+        let b_t = transpose_last2(b, store);
+        let grad_a = matmul_no_grad(grad, b_t, store);
+        let grad_a_shape = store.shape(grad_a).to_vec();
+        let ga_id = if grad_a_shape == a_shape {
+            grad_a
+        } else {
+            let grad_a_data = store.to_host(grad_a);
+            let ga = crate::utils::unbroadcast(&grad_a_data, &grad_a_shape, &a_shape);
+            store.from_vec(ga, &a_shape)
+        };
+
+        let a_t = transpose_last2(a, store);
+        let grad_b = matmul_no_grad(a_t, grad, store);
+        let grad_b_shape = store.shape(grad_b).to_vec();
+        let gb_id = if grad_b_shape == b_shape {
+            grad_b
+        } else {
+            let grad_b_data = store.to_host(grad_b);
+            let gb = crate::utils::unbroadcast(&grad_b_data, &grad_b_shape, &b_shape);
+            store.from_vec(gb, &b_shape)
+        };
+
+        vec![Some(ga_id), Some(gb_id)]
+    } else { vec![None, None] }
+}
+
+/// Transpose the last two dimensions on CPU.
+#[cfg(feature = "cpu")]
 fn transpose_last2(a: TensorId, store: &mut TensorStore) -> TensorId {
     let shape = store.shape(a).to_vec();
     let ndim = shape.len();
@@ -247,6 +281,48 @@ fn transpose_last2(a: TensorId, store: &mut TensorStore) -> TensorId {
     out_shape.push(n);
     out_shape.push(m);
     store.from_vec(out, &out_shape)
+}
+
+/// Transpose the last two dimensions on GPU via the `permute_f32` kernel.
+#[cfg(feature = "cuda")]
+fn transpose_last2(a: TensorId, store: &mut TensorStore) -> TensorId {
+    let shape = store.shape(a).to_vec();
+    let ndim = shape.len();
+    let a_id = store.ensure_contiguous(a);
+
+    let mut dims: Vec<usize> = (0..ndim).collect();
+    dims.swap(ndim - 2, ndim - 1);
+
+    let mut new_shape = shape.clone();
+    new_shape.swap(ndim - 2, ndim - 1);
+    let src_strides = compute_strides(&shape);
+    let dst_strides = compute_strides(&new_shape);
+    let size = shape_size(&shape);
+
+    let out = store.zeros(&new_shape);
+    let dev = GpuDevice::instance();
+    let src_ptr = store.dev_ptr(a_id);
+    let out_ptr = store.dev_ptr(out);
+
+    let mut ds = [1i32; 4];
+    let mut es = [0i32; 4];
+    for d in 0..ndim.min(4) {
+        ds[d] = dst_strides[d] as i32;
+        es[d] = src_strides[dims[d]] as i32;
+    }
+
+    let func = dev.get_func("permute_f32");
+    unsafe {
+        dev.stream.launch_builder(func)
+            .arg(&out_ptr).arg(&src_ptr)
+            .arg(&(size as i32))
+            .arg(&ds[0]).arg(&ds[1]).arg(&ds[2]).arg(&ds[3])
+            .arg(&es[0]).arg(&es[1]).arg(&es[2]).arg(&es[3])
+            .arg(&(ndim as i32))
+            .launch(LaunchConfig { grid_dim: (((size as u32) + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+            .unwrap();
+    }
+    out
 }
 
 /// Matmul without recording to tape (used in backward).

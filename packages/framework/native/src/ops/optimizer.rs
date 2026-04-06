@@ -3,7 +3,7 @@ use crate::tensor::{TensorId, TensorStore};
 #[cfg(feature = "cuda")]
 use crate::device::GpuDevice;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{DevicePtr, LaunchConfig};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 #[cfg(feature = "cuda")]
 fn launch_cfg(n: u32) -> LaunchConfig {
@@ -94,10 +94,10 @@ pub fn adamw_step(
             let param_tensor = (*tensors_ptr.add(pid)).as_mut().unwrap();
             let grad_tensor = (*tensors_ptr.add(grad_id)).as_ref().unwrap();
 
-            let param_ptr = *param_tensor.data.device_ptr();
-            let m_ptr = *param_tensor.adam_m.as_ref().unwrap().device_ptr();
-            let v_ptr = *param_tensor.adam_v.as_ref().unwrap().device_ptr();
-            let grad_ptr = *grad_tensor.data.device_ptr();
+            let param_ptr = dev.ptr(&param_tensor.data);
+            let m_ptr = dev.ptr(param_tensor.adam_m.as_ref().unwrap());
+            let v_ptr = dev.ptr(param_tensor.adam_v.as_ref().unwrap());
+            let grad_ptr = dev.ptr(&grad_tensor.data);
 
             let func = dev.get_func("adamw_step_f32");
             dev.stream.launch_builder(func)

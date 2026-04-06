@@ -353,3 +353,18 @@ pub fn reset_engine() {
     eng.store = TensorStore::new();
     eng.tape = Tape::new();
 }
+
+#[napi]
+pub fn gc_tensors(keep_ids: Vec<u32>) {
+    let mut eng = engine().lock();
+    let keep: std::collections::HashSet<usize> =
+        keep_ids.iter().map(|&id| id as usize).collect();
+    let len = eng.store.tensors.len();
+    for id in 0..len {
+        if !keep.contains(&id) && eng.store.tensors[id].is_some() {
+            eng.store.free(id);
+        }
+    }
+    eng.store.clear_alloc_cache();
+    eng.tape = Tape::new();
+}

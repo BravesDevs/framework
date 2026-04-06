@@ -57,3 +57,53 @@ void div_f32(float* out, const float* a, const float* b, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] / b[i];
 }
+
+extern "C" __global__
+void copy_f32(float* out, const float* src, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = src[i];
+}
+
+extern "C" __global__
+void permute_f32(float* out, const float* src, int n,
+                 int ds0, int ds1, int ds2, int ds3,
+                 int es0, int es1, int es2, int es3,
+                 int ndim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int rem = idx;
+    int src_idx = 0;
+    if (ndim >= 1) { int c = rem / ds0; rem %= ds0; src_idx += c * es0; }
+    if (ndim >= 2) { int c = rem / ds1; rem %= ds1; src_idx += c * es1; }
+    if (ndim >= 3) { int c = rem / ds2; rem %= ds2; src_idx += c * es2; }
+    if (ndim >= 4) { src_idx += rem * es3; }
+    out[idx] = src[src_idx];
+}
+
+extern "C" __global__
+void broadcast_add_f32(float* out, const float* a, const float* b,
+                       int n, int b_size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i % b_size];
+}
+
+extern "C" __global__
+void broadcast_mul_f32(float* out, const float* a, const float* b,
+                       int n, int b_size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] * b[i % b_size];
+}
+
+extern "C" __global__
+void sum_reduce_all_f32(float* out, const float* inp, int n) {
+    __shared__ float sdata[256];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+    sdata[tid] = (i < n) ? inp[i] : 0.0f;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(out, sdata[0]);
+}

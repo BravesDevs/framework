@@ -7,18 +7,27 @@ const __dirname_f = dirname(fileURLToPath(import.meta.url));
 
 function loadNative() {
     const require = createRequire(import.meta.url);
+    const platform = process.platform;
+    const arch = process.arch;
+    let suffix: string;
+    if (platform === 'darwin' && arch === 'arm64') {
+        suffix = 'darwin-arm64';
+    } else if (platform === 'linux' && arch === 'x64') {
+        suffix = 'linux-x64-gnu';
+    } else {
+        suffix = `${platform}-${arch}`;
+    }
+    const ext = platform === 'darwin' ? 'dylib' : 'so';
     const candidates = [
-        join(__dirname_f, '..', 'native', 'mni-framework-native.darwin-arm64.node'),
-        join(__dirname_f, '..', 'native', 'mni-framework-native.linux-x64-gnu.node'),
-        join(__dirname_f, '..', 'native', 'target', 'release', 'libmni_framework_native.dylib'),
-        join(__dirname_f, '..', 'native', 'target', 'release', 'libmni_framework_native.so'),
+        join(__dirname_f, '..', 'native', `mni-framework-native.${suffix}.node`),
+        join(__dirname_f, '..', 'native', 'target', 'release', `libmni_framework_native.${ext}`),
     ];
     for (const p of candidates) {
         if (existsSync(p)) {
             return require(p);
         }
     }
-    throw new Error(`Native addon not found. Tried: ${candidates.join(', ')}`);
+    throw new Error(`Native addon not found for ${platform}-${arch}. Tried: ${candidates.join(', ')}`);
 }
 
 export const native: any = loadNative();

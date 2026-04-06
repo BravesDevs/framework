@@ -31,6 +31,10 @@ impl CachingAllocator {
         self.free_lists.entry(size).or_default().push(buf);
     }
 
+    pub fn clear_cache(&mut self) {
+        self.free_lists.clear();
+    }
+
     pub fn allocated_bytes(&self) -> usize {
         self.total_allocated
     }
@@ -68,6 +72,10 @@ impl CachingAllocator {
     pub fn dealloc(&mut self, buf: CudaSlice<f32>) {
         let size = buf.len();
         self.free_lists.entry(size).or_default().push(buf);
+    }
+
+    pub fn clear_cache(&mut self) {
+        self.free_lists.clear();
     }
 
     pub fn allocated_bytes(&self) -> usize {

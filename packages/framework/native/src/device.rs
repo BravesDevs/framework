@@ -1,7 +1,7 @@
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream};
+use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr};
 #[cfg(feature = "cuda")]
-use cudarc::cublas::CudaBlas;
+use cudarc::cublas::safe::CudaBlas;
 #[cfg(feature = "cuda")]
 use cudarc::nvrtc;
 #[cfg(feature = "cuda")]
@@ -9,17 +9,18 @@ use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, OnceLock};
 
-// ---------------------------------------------------------------------------
-// CUDA device
-// ---------------------------------------------------------------------------
-
 #[cfg(feature = "cuda")]
 pub struct GpuDevice {
     pub ctx: Arc<CudaContext>,
-    pub stream: CudaStream,
+    pub stream: Arc<CudaStream>,
     pub blas: CudaBlas,
     functions: HashMap<String, CudaFunction>,
 }
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for GpuDevice {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for GpuDevice {}
 
 #[cfg(feature = "cuda")]
 static GPU: OnceLock<GpuDevice> = OnceLock::new();
@@ -32,8 +33,9 @@ impl GpuDevice {
 
     fn init() -> Self {
         let ctx = CudaContext::new(0).expect("CUDA context creation failed");
+        unsafe { ctx.disable_event_tracking(); }
         let stream = ctx.default_stream();
-        let blas = CudaBlas::new(ctx.clone()).expect("cuBLAS handle creation failed");
+        let blas = CudaBlas::new(stream.clone()).expect("cuBLAS handle creation failed");
 
         let mut dev = Self {
             ctx,
@@ -54,7 +56,7 @@ impl GpuDevice {
             .unwrap_or_else(|e| panic!("Failed to load module {name}: {e}"));
         for &kname in kernel_names {
             let func = module
-                .get_function(kname)
+                .load_function(kname)
                 .unwrap_or_else(|e| panic!("Failed to get function {kname}: {e}"));
             self.functions.insert(kname.to_string(), func);
         }
@@ -75,6 +77,11 @@ impl GpuDevice {
                 "add_bias_f32",
                 "fill_f32",
                 "div_f32",
+                "copy_f32",
+                "permute_f32",
+                "broadcast_add_f32",
+                "broadcast_mul_f32",
+                "sum_reduce_all_f32",
             ],
         );
         self.compile_and_load(
@@ -139,11 +146,15 @@ impl GpuDevice {
             .get(name)
             .unwrap_or_else(|| panic!("Kernel function '{name}' not found"))
     }
-}
 
-// ---------------------------------------------------------------------------
-// CPU stub (no-op)
-// ---------------------------------------------------------------------------
+    pub fn ptr<T>(&self, slice: &CudaSlice<T>) -> u64
+    where
+        CudaSlice<T>: DevicePtr<T>,
+    {
+        let (ptr, _guard) = slice.device_ptr(&self.stream);
+        ptr
+    }
+}
 
 #[cfg(feature = "cpu")]
 pub struct GpuDevice;

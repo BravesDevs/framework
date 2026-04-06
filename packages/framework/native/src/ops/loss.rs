@@ -5,7 +5,7 @@ use crate::tensor::{TensorId, TensorStore, shape_size};
 #[cfg(feature = "cuda")]
 use crate::device::GpuDevice;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{DevicePtr, LaunchConfig};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 #[cfg(feature = "cuda")]
 fn launch_cfg(n: u32) -> LaunchConfig {
@@ -79,8 +79,8 @@ pub fn cross_entropy(
     let logits_ptr = store.dev_ptr(logits);
 
     let targets_i32: Vec<i32> = targets.iter().map(|&t| t as i32).collect();
-    let targets_gpu = dev.stream.clone_htod(&targets_i32).unwrap();
-    let targets_ptr = *targets_gpu.device_ptr();
+    let targets_gpu = dev.stream.memcpy_stod(&targets_i32).unwrap();
+    let targets_ptr = dev.ptr(&targets_gpu);
 
     let losses_id = store.zeros(&[n]);
     let losses_ptr = store.dev_ptr(losses_id);
@@ -100,9 +100,20 @@ pub fn cross_entropy(
             .unwrap();
     }
 
-    let losses_host = store.to_host(losses_id);
-    let loss = losses_host.iter().sum::<f32>() / n as f32;
-    let loss_id = store.from_vec(vec![loss], &[1]);
+    let loss_id = store.zeros(&[1]);
+    let loss_ptr = store.dev_ptr(loss_id);
+    let mean_func = dev.get_func("mean_along_dim_f32");
+    unsafe {
+        dev.stream.launch_builder(mean_func)
+            .arg(&loss_ptr)
+            .arg(&losses_ptr)
+            .arg(&1i32)
+            .arg(&(n as i32))
+            .arg(&1i32)
+            .arg(&1i32)
+            .launch(launch_cfg(1))
+            .unwrap();
+    }
 
     tape.record(TapeEntry {
         op: BackwardOp::CrossEntropy, output_id: loss_id,
@@ -147,8 +158,8 @@ pub fn cross_entropy_backward(grad: TensorId, saved: &SavedContext, store: &mut 
         let sm_ptr = store.dev_ptr(*sm_id);
 
         let targets_i32: Vec<i32> = targets.iter().map(|&t| t as i32).collect();
-        let targets_gpu = dev.stream.clone_htod(&targets_i32).unwrap();
-        let targets_ptr = *targets_gpu.device_ptr();
+        let targets_gpu = dev.stream.memcpy_stod(&targets_i32).unwrap();
+        let targets_ptr = dev.ptr(&targets_gpu);
 
         let dlogits_id = store.zeros(&shape);
         let dlogits_ptr = store.dev_ptr(dlogits_id);

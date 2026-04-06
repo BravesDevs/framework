@@ -6,7 +6,7 @@ use crate::utils::{broadcast_shape, unbroadcast, to_coord};
 #[cfg(feature = "cuda")]
 use crate::device::GpuDevice;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{DevicePtr, LaunchConfig};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 #[cfg(feature = "cuda")]
 fn launch_cfg(n: u32) -> LaunchConfig {
@@ -81,9 +81,9 @@ pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
     if a_shape == b_shape {
         let n = shape_size(&a_shape);
         let out = store.zeros(&out_shape);
-        let out_ptr = *store.get(out).data.device_ptr();
-        let a_ptr = *store.get(a).data.device_ptr();
-        let b_ptr = *store.get(b).data.device_ptr();
+        let out_ptr = store.dev_ptr(out);
+        let a_ptr = store.dev_ptr(a);
+        let b_ptr = store.dev_ptr(b);
         let dev = GpuDevice::instance();
         let func = dev.get_func("add_f32");
         unsafe {
@@ -106,9 +106,9 @@ pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
         let total = shape_size(&a_shape);
         let bias_size = b_shape[0];
         let out = store.zeros(&out_shape);
-        let out_ptr = *store.get(out).data.device_ptr();
-        let a_ptr = *store.get(a).data.device_ptr();
-        let b_ptr = *store.get(b).data.device_ptr();
+        let out_ptr = store.dev_ptr(out);
+        let a_ptr = store.dev_ptr(a);
+        let b_ptr = store.dev_ptr(b);
         let dev = GpuDevice::instance();
         let func = dev.get_func("add_bias_f32");
         unsafe {
@@ -129,39 +129,66 @@ pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
         });
         out
     } else {
-        let a_data = store.to_host(a);
-        let b_data = store.to_host(b);
+        let a_size = shape_size(&a_shape);
+        let b_size = shape_size(&b_shape);
         let out_size = shape_size(&out_shape);
-        let out_strides = compute_strides(&out_shape);
-        let a_strides = compute_strides(&a_shape);
-        let b_strides = compute_strides(&b_shape);
-        let ndim = out_shape.len();
-        let a_off = ndim - a_shape.len();
-        let b_off = ndim - b_shape.len();
-
-        let mut data = vec![0.0f32; out_size];
-        for i in 0..out_size {
-            let coord = to_coord(i, &out_shape, &out_strides);
-            let mut ai = 0;
-            for d in 0..a_shape.len() {
-                let c = if a_shape[d] == 1 { 0 } else { coord[d + a_off] };
-                ai += c * a_strides[d];
+        if out_size == a_size && a_size % b_size == 0 {
+            let out = store.zeros(&out_shape);
+            let out_ptr = store.dev_ptr(out);
+            let a_ptr = store.dev_ptr(a);
+            let b_ptr = store.dev_ptr(b);
+            let dev = GpuDevice::instance();
+            let func = dev.get_func("broadcast_add_f32");
+            unsafe {
+                dev.stream.launch_builder(func)
+                    .arg(&out_ptr)
+                    .arg(&a_ptr)
+                    .arg(&b_ptr)
+                    .arg(&(a_size as i32))
+                    .arg(&(b_size as i32))
+                    .launch(launch_cfg(a_size as u32))
+                    .unwrap();
             }
-            let mut bi = 0;
-            for d in 0..b_shape.len() {
-                let c = if b_shape[d] == 1 { 0 } else { coord[d + b_off] };
-                bi += c * b_strides[d];
+            tape.record(TapeEntry {
+                op: BackwardOp::Add,
+                output_id: out,
+                input_ids: smallvec![a, b],
+                saved: SavedContext::TensorsAndShape(smallvec![a, b], out_shape),
+            });
+            out
+        } else {
+            let a_data = store.to_host(a);
+            let b_data = store.to_host(b);
+            let out_strides = compute_strides(&out_shape);
+            let a_strides = compute_strides(&a_shape);
+            let b_strides = compute_strides(&b_shape);
+            let ndim = out_shape.len();
+            let a_off = ndim - a_shape.len();
+            let b_off = ndim - b_shape.len();
+            let mut data = vec![0.0f32; out_size];
+            for i in 0..out_size {
+                let coord = to_coord(i, &out_shape, &out_strides);
+                let mut ai = 0;
+                for d in 0..a_shape.len() {
+                    let c = if a_shape[d] == 1 { 0 } else { coord[d + a_off] };
+                    ai += c * a_strides[d];
+                }
+                let mut bi = 0;
+                for d in 0..b_shape.len() {
+                    let c = if b_shape[d] == 1 { 0 } else { coord[d + b_off] };
+                    bi += c * b_strides[d];
+                }
+                data[i] = a_data[ai] + b_data[bi];
             }
-            data[i] = a_data[ai] + b_data[bi];
+            let out = store.from_vec(data, &out_shape);
+            tape.record(TapeEntry {
+                op: BackwardOp::Add,
+                output_id: out,
+                input_ids: smallvec![a, b],
+                saved: SavedContext::TensorsAndShape(smallvec![a, b], out_shape),
+            });
+            out
         }
-        let out = store.from_vec(data, &out_shape);
-        tape.record(TapeEntry {
-            op: BackwardOp::Add,
-            output_id: out,
-            input_ids: smallvec![a, b],
-            saved: SavedContext::TensorsAndShape(smallvec![a, b], out_shape),
-        });
-        out
     }
 }
 
@@ -191,9 +218,8 @@ pub fn add_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStor
         let grad_shape = store.shape(grad).to_vec();
 
         if a_shape == grad_shape && b_shape == grad_shape {
-            let grad_data = store.to_host(grad);
-            let ga = store.from_vec(grad_data.clone(), &a_shape);
-            let gb = store.from_vec(grad_data, &b_shape);
+            let ga = store.clone_device(grad, &a_shape);
+            let gb = store.clone_device(grad, &b_shape);
             vec![Some(ga), Some(gb)]
         } else {
             let grad_data = store.to_host(grad);
@@ -229,9 +255,9 @@ pub fn mul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
     if a_shape == b_shape {
         let n = shape_size(&a_shape);
         let out = store.zeros(&a_shape);
-        let out_ptr = *store.get(out).data.device_ptr();
-        let a_ptr = *store.get(a).data.device_ptr();
-        let b_ptr = *store.get(b).data.device_ptr();
+        let out_ptr = store.dev_ptr(out);
+        let a_ptr = store.dev_ptr(a);
+        let b_ptr = store.dev_ptr(b);
         let dev = GpuDevice::instance();
         let func = dev.get_func("mul_f32");
         unsafe {
@@ -252,39 +278,66 @@ pub fn mul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
         out
     } else {
         let out_shape = broadcast_shape(&a_shape, &b_shape);
-        let a_data = store.to_host(a);
-        let b_data = store.to_host(b);
+        let a_size = shape_size(&a_shape);
+        let b_size = shape_size(&b_shape);
         let out_size = shape_size(&out_shape);
-        let out_strides = compute_strides(&out_shape);
-        let a_strides = compute_strides(&a_shape);
-        let b_strides = compute_strides(&b_shape);
-        let ndim = out_shape.len();
-        let a_off = ndim - a_shape.len();
-        let b_off = ndim - b_shape.len();
-
-        let mut data = vec![0.0f32; out_size];
-        for i in 0..out_size {
-            let coord = to_coord(i, &out_shape, &out_strides);
-            let mut ai = 0;
-            for d in 0..a_shape.len() {
-                let c = if a_shape[d] == 1 { 0 } else { coord[d + a_off] };
-                ai += c * a_strides[d];
+        if out_size == a_size && a_size % b_size == 0 {
+            let out = store.zeros(&out_shape);
+            let out_ptr = store.dev_ptr(out);
+            let a_ptr = store.dev_ptr(a);
+            let b_ptr = store.dev_ptr(b);
+            let dev = GpuDevice::instance();
+            let func = dev.get_func("broadcast_mul_f32");
+            unsafe {
+                dev.stream.launch_builder(func)
+                    .arg(&out_ptr)
+                    .arg(&a_ptr)
+                    .arg(&b_ptr)
+                    .arg(&(a_size as i32))
+                    .arg(&(b_size as i32))
+                    .launch(launch_cfg(a_size as u32))
+                    .unwrap();
             }
-            let mut bi = 0;
-            for d in 0..b_shape.len() {
-                let c = if b_shape[d] == 1 { 0 } else { coord[d + b_off] };
-                bi += c * b_strides[d];
+            tape.record(TapeEntry {
+                op: BackwardOp::Mul,
+                output_id: out,
+                input_ids: smallvec![a, b],
+                saved: SavedContext::Tensors(smallvec![a, b]),
+            });
+            out
+        } else {
+            let a_data = store.to_host(a);
+            let b_data = store.to_host(b);
+            let out_strides = compute_strides(&out_shape);
+            let a_strides = compute_strides(&a_shape);
+            let b_strides = compute_strides(&b_shape);
+            let ndim = out_shape.len();
+            let a_off = ndim - a_shape.len();
+            let b_off = ndim - b_shape.len();
+            let mut data = vec![0.0f32; out_size];
+            for i in 0..out_size {
+                let coord = to_coord(i, &out_shape, &out_strides);
+                let mut ai = 0;
+                for d in 0..a_shape.len() {
+                    let c = if a_shape[d] == 1 { 0 } else { coord[d + a_off] };
+                    ai += c * a_strides[d];
+                }
+                let mut bi = 0;
+                for d in 0..b_shape.len() {
+                    let c = if b_shape[d] == 1 { 0 } else { coord[d + b_off] };
+                    bi += c * b_strides[d];
+                }
+                data[i] = a_data[ai] * b_data[bi];
             }
-            data[i] = a_data[ai] * b_data[bi];
+            let out = store.from_vec(data, &out_shape);
+            tape.record(TapeEntry {
+                op: BackwardOp::Mul,
+                output_id: out,
+                input_ids: smallvec![a, b],
+                saved: SavedContext::Tensors(smallvec![a, b]),
+            });
+            out
         }
-        let out = store.from_vec(data, &out_shape);
-        tape.record(TapeEntry {
-            op: BackwardOp::Mul,
-            output_id: out,
-            input_ids: smallvec![a, b],
-            saved: SavedContext::Tensors(smallvec![a, b]),
-        });
-        out
     }
 }
 
@@ -348,11 +401,11 @@ pub fn mul_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStor
             let n = shape_size(&grad_shape);
             let ga = store.zeros(&a_shape);
             let gb = store.zeros(&b_shape);
-            let ga_ptr = *store.get(ga).data.device_ptr();
-            let gb_ptr = *store.get(gb).data.device_ptr();
-            let grad_ptr = *store.get(grad).data.device_ptr();
-            let a_ptr = *store.get(a).data.device_ptr();
-            let b_ptr = *store.get(b).data.device_ptr();
+            let ga_ptr = store.dev_ptr(ga);
+            let gb_ptr = store.dev_ptr(gb);
+            let grad_ptr = store.dev_ptr(grad);
+            let a_ptr = store.dev_ptr(a);
+            let b_ptr = store.dev_ptr(b);
             let dev = GpuDevice::instance();
 
             let func_a = dev.get_func("mul_f32");
@@ -439,9 +492,9 @@ pub fn sub(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
     if a_shape == b_shape {
         let n = shape_size(&a_shape);
         let out = store.zeros(&a_shape);
-        let out_ptr = *store.get(out).data.device_ptr();
-        let a_ptr = *store.get(a).data.device_ptr();
-        let b_ptr = *store.get(b).data.device_ptr();
+        let out_ptr = store.dev_ptr(out);
+        let a_ptr = store.dev_ptr(a);
+        let b_ptr = store.dev_ptr(b);
         let dev = GpuDevice::instance();
         let func = dev.get_func("sub_f32");
         unsafe {
@@ -526,12 +579,11 @@ pub fn sub_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStor
 
         if a_shape == grad_shape && b_shape == grad_shape {
             let n = shape_size(&grad_shape);
-            let grad_data = store.to_host(grad);
-            let ga = store.from_vec(grad_data, &a_shape);
+            let ga = store.clone_device(grad, &a_shape);
 
             let gb = store.zeros(&b_shape);
-            let gb_ptr = *store.get(gb).data.device_ptr();
-            let grad_ptr = *store.get(grad).data.device_ptr();
+            let gb_ptr = store.dev_ptr(gb);
+            let grad_ptr = store.dev_ptr(grad);
             let dev = GpuDevice::instance();
             let func = dev.get_func("neg_f32");
             unsafe {
@@ -574,8 +626,8 @@ pub fn neg(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> TensorId {
     let shape = store.shape(a).to_vec();
     let n = shape_size(&shape);
     let out = store.zeros(&shape);
-    let out_ptr = *store.get(out).data.device_ptr();
-    let a_ptr = *store.get(a).data.device_ptr();
+    let out_ptr = store.dev_ptr(out);
+    let a_ptr = store.dev_ptr(a);
     let dev = GpuDevice::instance();
     let func = dev.get_func("neg_f32");
     unsafe {
@@ -609,8 +661,8 @@ pub fn neg_backward(grad: TensorId, _saved: &SavedContext, store: &mut TensorSto
     let shape = store.shape(grad).to_vec();
     let n = shape_size(&shape);
     let out = store.zeros(&shape);
-    let out_ptr = *store.get(out).data.device_ptr();
-    let grad_ptr = *store.get(grad).data.device_ptr();
+    let out_ptr = store.dev_ptr(out);
+    let grad_ptr = store.dev_ptr(grad);
     let dev = GpuDevice::instance();
     let func = dev.get_func("neg_f32");
     unsafe {
@@ -645,8 +697,8 @@ pub fn mul_scalar(a: TensorId, s: f32, store: &mut TensorStore, tape: &mut Tape)
     let shape = store.shape(a).to_vec();
     let n = shape_size(&shape);
     let out = store.zeros(&shape);
-    let out_ptr = *store.get(out).data.device_ptr();
-    let a_ptr = *store.get(a).data.device_ptr();
+    let out_ptr = store.dev_ptr(out);
+    let a_ptr = store.dev_ptr(a);
     let dev = GpuDevice::instance();
     let func = dev.get_func("mul_scalar_f32");
     unsafe {
@@ -684,8 +736,8 @@ pub fn mul_scalar_backward(grad: TensorId, saved: &SavedContext, store: &mut Ten
         let shape = store.shape(grad).to_vec();
         let n = shape_size(&shape);
         let out = store.zeros(&shape);
-        let out_ptr = *store.get(out).data.device_ptr();
-        let grad_ptr = *store.get(grad).data.device_ptr();
+        let out_ptr = store.dev_ptr(out);
+        let grad_ptr = store.dev_ptr(grad);
         let dev = GpuDevice::instance();
         let func = dev.get_func("mul_scalar_f32");
         unsafe {
@@ -722,8 +774,8 @@ pub fn exp(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> TensorId {
     let shape = store.shape(a).to_vec();
     let n = shape_size(&shape);
     let out = store.zeros(&shape);
-    let out_ptr = *store.get(out).data.device_ptr();
-    let a_ptr = *store.get(a).data.device_ptr();
+    let out_ptr = store.dev_ptr(out);
+    let a_ptr = store.dev_ptr(a);
     let dev = GpuDevice::instance();
     let func = dev.get_func("exp_f32");
     unsafe {
@@ -762,9 +814,9 @@ pub fn exp_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStor
         let shape = store.shape(grad).to_vec();
         let n = shape_size(&shape);
         let result = store.zeros(&shape);
-        let result_ptr = *store.get(result).data.device_ptr();
-        let grad_ptr = *store.get(grad).data.device_ptr();
-        let exp_ptr = *store.get(*exp_out).data.device_ptr();
+        let result_ptr = store.dev_ptr(result);
+        let grad_ptr = store.dev_ptr(grad);
+        let exp_ptr = store.dev_ptr(*exp_out);
         let dev = GpuDevice::instance();
         let func = dev.get_func("mul_f32");
         unsafe {
@@ -801,8 +853,8 @@ pub fn log(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> TensorId {
     let shape = store.shape(a).to_vec();
     let n = shape_size(&shape);
     let out = store.zeros(&shape);
-    let out_ptr = *store.get(out).data.device_ptr();
-    let a_ptr = *store.get(a).data.device_ptr();
+    let out_ptr = store.dev_ptr(out);
+    let a_ptr = store.dev_ptr(a);
     let dev = GpuDevice::instance();
     let func = dev.get_func("log_f32");
     unsafe {
@@ -841,9 +893,9 @@ pub fn log_backward(grad: TensorId, saved: &SavedContext, store: &mut TensorStor
         let shape = store.shape(grad).to_vec();
         let n = shape_size(&shape);
         let result = store.zeros(&shape);
-        let result_ptr = *store.get(result).data.device_ptr();
-        let grad_ptr = *store.get(grad).data.device_ptr();
-        let inp_ptr = *store.get(*inp).data.device_ptr();
+        let result_ptr = store.dev_ptr(result);
+        let grad_ptr = store.dev_ptr(grad);
+        let inp_ptr = store.dev_ptr(*inp);
         let dev = GpuDevice::instance();
         let func = dev.get_func("div_f32");
         unsafe {

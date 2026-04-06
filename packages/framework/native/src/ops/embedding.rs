@@ -5,7 +5,7 @@ use crate::tensor::{TensorId, TensorStore};
 #[cfg(feature = "cuda")]
 use crate::device::GpuDevice;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{DevicePtr, LaunchConfig};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 #[cfg(feature = "cuda")]
 fn launch_cfg(n: u32) -> LaunchConfig {
@@ -63,8 +63,8 @@ pub fn embedding_forward(
     let weight_ptr = store.dev_ptr(weight);
 
     let indices_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
-    let indices_gpu = dev.stream.clone_htod(&indices_i32).unwrap();
-    let indices_ptr = *indices_gpu.device_ptr();
+    let indices_gpu = dev.stream.memcpy_stod(&indices_i32).unwrap();
+    let indices_ptr = dev.ptr(&indices_gpu);
 
     let out_shape = vec![batch, seq_len, embed_dim];
     let out_id = store.zeros(&out_shape);
@@ -130,8 +130,8 @@ pub fn embedding_backward(grad: TensorId, saved: &SavedContext, store: &mut Tens
         let grad_ptr = store.dev_ptr(grad);
 
         let indices_i32: Vec<i32> = indices.iter().map(|&i| i as i32).collect();
-        let indices_gpu = dev.stream.clone_htod(&indices_i32).unwrap();
-        let indices_ptr = *indices_gpu.device_ptr();
+        let indices_gpu = dev.stream.memcpy_stod(&indices_i32).unwrap();
+        let indices_ptr = dev.ptr(&indices_gpu);
 
         let dw_id = store.zeros(&w_shape);
         let dw_ptr = store.dev_ptr(dw_id);

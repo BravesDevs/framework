@@ -316,6 +316,10 @@ impl TensorStore {
         let shape = self.get(id).shape.clone();
         self.from_vec(data, &shape)
     }
+
+    pub fn clear_alloc_cache(&mut self) {
+        self.alloc.clear_cache();
+    }
 }
 
 // =========================================================================
@@ -323,7 +327,7 @@ impl TensorStore {
 // =========================================================================
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 #[cfg(feature = "cuda")]
 fn launch_cfg(n: u32) -> LaunchConfig {
@@ -337,7 +341,6 @@ fn launch_cfg(n: u32) -> LaunchConfig {
 #[cfg(feature = "cuda")]
 impl TensorStore {
     pub fn new() -> Self {
-        // Force CUDA device initialization
         let _ = crate::device::GpuDevice::instance();
         Self {
             tensors: Vec::new(),
@@ -354,16 +357,17 @@ impl TensorStore {
     }
 
     pub fn dev_ptr(&self, id: TensorId) -> u64 {
-        *self.get(id).data.device_ptr()
+        let dev = crate::device::GpuDevice::instance();
+        dev.ptr(&self.get(id).data)
     }
 
     pub fn to_host(&self, id: TensorId) -> Vec<f32> {
         let dev = crate::device::GpuDevice::instance();
         let t = self.get(id);
         if t.is_contiguous() {
-            dev.stream.clone_dtoh(&t.data).unwrap()
+            dev.stream.memcpy_dtov(&t.data).unwrap()
         } else {
-            let host = dev.stream.clone_dtoh(&t.data).unwrap();
+            let host = dev.stream.memcpy_dtov(&t.data).unwrap();
             let size = t.size;
             let ndim = t.shape.len();
             let out_strides = compute_strides(&t.shape);
@@ -384,7 +388,7 @@ impl TensorStore {
 
     pub fn get_scalar(&self, id: TensorId) -> f32 {
         let dev = crate::device::GpuDevice::instance();
-        let v = dev.stream.clone_dtoh(&self.get(id).data).unwrap();
+        let v = dev.stream.memcpy_dtov(&self.get(id).data).unwrap();
         v[0]
     }
 
@@ -392,7 +396,7 @@ impl TensorStore {
         if let Some(grad_id) = self.get(id).grad {
             let size = self.get(grad_id).size;
             let dev = crate::device::GpuDevice::instance();
-            let out_ptr = *self.get(grad_id).data.device_ptr();
+            let out_ptr = dev.ptr(&self.get(grad_id).data);
             let func = dev.get_func("fill_f32");
             unsafe {
                 dev.stream.launch_builder(func)
@@ -424,7 +428,7 @@ impl TensorStore {
             requires_grad: false, grad: None, adam_m: None, adam_v: None,
         });
         let dev = crate::device::GpuDevice::instance();
-        let ptr = *self.get(id).data.device_ptr();
+        let ptr = dev.ptr(&self.get(id).data);
         let func = dev.get_func("fill_f32");
         unsafe {
             dev.stream.launch_builder(func)
@@ -456,7 +460,7 @@ impl TensorStore {
     pub fn from_slice(&mut self, src: &[f32], shape: &[usize]) -> TensorId {
         let size = shape_size(shape);
         let dev = crate::device::GpuDevice::instance();
-        let data = dev.stream.clone_htod(&src[..size]).unwrap();
+        let data = dev.stream.memcpy_stod(&src[..size]).unwrap();
         let strides = compute_strides(shape);
         self.insert(GpuTensor {
             data, shape: shape.to_vec(), strides, size,
@@ -468,13 +472,12 @@ impl TensorStore {
         self.from_slice(&src, shape)
     }
 
-    /// GPU-side gradient accumulation: grad[i] += src[i]
     pub fn accumulate_grad(&mut self, dst: TensorId, src: TensorId) {
         let grad_id = self.ensure_grad(dst);
         let size = self.get(src).size;
         let dev = crate::device::GpuDevice::instance();
-        let src_ptr = *self.get(src).data.device_ptr();
-        let grad_ptr = *self.get(grad_id).data.device_ptr();
+        let src_ptr = dev.ptr(&self.get(src).data);
+        let grad_ptr = dev.ptr(&self.get(grad_id).data);
         let func = dev.get_func("add_f32");
         unsafe {
             dev.stream.launch_builder(func)
@@ -487,12 +490,11 @@ impl TensorStore {
         }
     }
 
-    /// In-place addition on GPU: dst[i] += src[i]
     pub fn add_inplace(&mut self, dst: TensorId, src: TensorId) {
         let size = self.get(src).size;
         let dev = crate::device::GpuDevice::instance();
-        let src_ptr = *self.get(src).data.device_ptr();
-        let dst_ptr = *self.get(dst).data.device_ptr();
+        let src_ptr = dev.ptr(&self.get(src).data);
+        let dst_ptr = dev.ptr(&self.get(dst).data);
         let func = dev.get_func("add_f32");
         unsafe {
             dev.stream.launch_builder(func)
@@ -512,5 +514,28 @@ impl TensorStore {
         let data = self.to_host(id);
         let shape = self.get(id).shape.clone();
         self.from_vec(data, &shape)
+    }
+
+    /// Copy tensor data on device with a new shape (no CPU roundtrip).
+    pub fn clone_device(&mut self, src: TensorId, new_shape: &[usize]) -> TensorId {
+        let size = self.size(src);
+        let out = self.zeros(new_shape);
+        let dev = crate::device::GpuDevice::instance();
+        let src_ptr = dev.ptr(&self.get(src).data);
+        let out_ptr = dev.ptr(&self.get(out).data);
+        let func = dev.get_func("copy_f32");
+        unsafe {
+            dev.stream.launch_builder(func)
+                .arg(&out_ptr)
+                .arg(&src_ptr)
+                .arg(&(size as i32))
+                .launch(launch_cfg(size as u32))
+                .unwrap();
+        }
+        out
+    }
+
+    pub fn clear_alloc_cache(&mut self) {
+        self.alloc.clear_cache();
     }
 }
