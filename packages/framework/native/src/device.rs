@@ -139,6 +139,26 @@ impl GpuDevice {
             include_str!("../kernels/grad_util.cu"),
             &["grad_norm_sq_partial_f32", "grad_clip_f32"],
         );
+        self.compile_and_load(
+            "data",
+            include_str!("../kernels/data.cu"),
+            &["sample_batch_i32"],
+        );
+        self.compile_and_load(
+            "flash_attention",
+            include_str!("../kernels/flash_attention.cu"),
+            &["flash_attention_forward_f32", "flash_attention_backward_f32"],
+        );
+        self.compile_and_load(
+            "fused_ops",
+            include_str!("../kernels/fused_ops.cu"),
+            &["residual_layernorm_forward_f32", "bias_gelu_forward_f32", "bias_gelu_backward_f32"],
+        );
+        self.compile_and_load(
+            "mixed_precision",
+            include_str!("../kernels/mixed_precision.cu"),
+            &["f32_to_bf16", "bf16_to_f32", "scale_f32", "check_inf_nan_f32"],
+        );
     }
 
     pub fn get_func(&self, name: &str) -> &CudaFunction {

@@ -3,7 +3,7 @@ use crate::tensor::{TensorId, TensorStore};
 #[cfg(feature = "cuda")]
 use crate::device::GpuDevice;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 #[cfg(feature = "cuda")]
 fn launch_cfg(n: u32) -> LaunchConfig {
@@ -139,16 +139,38 @@ pub fn grad_norm(param_ids: &[TensorId], store: &TensorStore) -> f32 {
 
 #[cfg(feature = "cuda")]
 pub fn grad_norm(param_ids: &[TensorId], store: &TensorStore) -> f32 {
-    let mut norm_sq = 0.0f64;
+    let dev = GpuDevice::instance();
+    let mut total_norm_sq = 0.0f64;
+
     for &pid in param_ids {
         if let Some(grad_id) = store.get(pid).grad {
-            let data = store.to_host(grad_id);
-            for &v in &data {
-                norm_sq += (v as f64) * (v as f64);
+            let size = store.size(grad_id);
+            if size == 0 { continue; }
+
+            let num_blocks = ((size as u32) + 255) / 256;
+            let partial: CudaSlice<f32> = dev.stream.alloc_zeros(num_blocks as usize).unwrap();
+            let grad_ptr = store.dev_ptr(grad_id);
+            let partial_ptr = dev.ptr(&partial);
+
+            let func = dev.get_func("grad_norm_sq_partial_f32");
+            unsafe {
+                dev.stream.launch_builder(func)
+                    .arg(&partial_ptr)
+                    .arg(&grad_ptr)
+                    .arg(&(size as i32))
+                    .arg(&(num_blocks as i32))
+                    .launch(launch_cfg(size as u32))
+                    .unwrap();
+            }
+
+            let partial_host: Vec<f32> = dev.stream.memcpy_dtov(&partial).unwrap();
+            for &v in &partial_host {
+                total_norm_sq += v as f64;
             }
         }
     }
-    (norm_sq as f32).sqrt()
+
+    (total_norm_sq as f32).sqrt()
 }
 
 // =========================================================================
@@ -193,4 +215,62 @@ pub fn clip_grad_norm(param_ids: &[TensorId], max_norm: f32, store: &mut TensorS
             }
         }
     }
+}
+
+// =========================================================================
+// Fused clip + AdamW step (single N-API call, avoids JS round-trips)
+// =========================================================================
+
+#[cfg(feature = "cpu")]
+pub fn clip_and_step(
+    param_ids: &[TensorId],
+    lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32,
+    step: u32, max_grad_norm: f32,
+    store: &mut TensorStore,
+) -> f32 {
+    let norm = grad_norm(param_ids, store);
+    if max_grad_norm > 0.0 && norm > max_grad_norm {
+        let scale = max_grad_norm / norm;
+        for &pid in param_ids {
+            if let Some(grad_id) = store.get(pid).grad {
+                let data = store.data_mut(grad_id);
+                for v in data.iter_mut() {
+                    *v *= scale;
+                }
+            }
+        }
+    }
+    adamw_step(param_ids, lr, beta1, beta2, eps, weight_decay, step, store);
+    norm
+}
+
+#[cfg(feature = "cuda")]
+pub fn clip_and_step(
+    param_ids: &[TensorId],
+    lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32,
+    step: u32, max_grad_norm: f32,
+    store: &mut TensorStore,
+) -> f32 {
+    let norm = grad_norm(param_ids, store);
+    if max_grad_norm > 0.0 && norm > max_grad_norm {
+        let scale = max_grad_norm / norm;
+        let dev = GpuDevice::instance();
+        for &pid in param_ids {
+            if let Some(grad_id) = store.get(pid).grad {
+                let size = store.size(grad_id);
+                let grad_ptr = store.dev_ptr(grad_id);
+                let func = dev.get_func("grad_clip_f32");
+                unsafe {
+                    dev.stream.launch_builder(func)
+                        .arg(&grad_ptr)
+                        .arg(&scale)
+                        .arg(&(size as i32))
+                        .launch(launch_cfg(size as u32))
+                        .unwrap();
+                }
+            }
+        }
+    }
+    adamw_step(param_ids, lr, beta1, beta2, eps, weight_decay, step, store);
+    norm
 }

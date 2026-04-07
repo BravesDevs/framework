@@ -63,6 +63,11 @@ export class Embedding extends Module {
         const id = native.embeddingForward(this.weight.value._id, flat, batch, seqLen);
         return new Tensor(id);
     }
+
+    forwardGpu(intBufId: number, batch: number, seqLen: number): Tensor {
+        const id = native.embeddingForwardGpu(this.weight.value._id, intBufId, batch, seqLen);
+        return new Tensor(id);
+    }
 }
 
 // ============================================================
@@ -92,6 +97,24 @@ export function crossEntropyLoss(logits: Tensor, targets: number[][]): Tensor {
     const flatTargets = targets.flat();
     const id = native.crossEntropyLoss(flatLogits._id, flatTargets);
     return new Tensor(id);
+}
+
+export function crossEntropyLossGpu(logits: Tensor, intBufId: number): Tensor {
+    const id = native.crossEntropyLossGpu(logits._id, intBufId);
+    return new Tensor(id);
+}
+
+export function flashAttention(q: Tensor, k: Tensor, v: Tensor, scale: number, causal: boolean = true): Tensor {
+    const id = native.flashAttention(q._id, k._id, v._id, scale, causal);
+    return new Tensor(id);
+}
+
+export function residualLayerNorm(x: Tensor, residual: Tensor, gamma: Tensor, beta: Tensor, eps: number = 1e-5): Tensor {
+    return new Tensor(native.residualLayernorm(x._id, residual._id, gamma._id, beta._id, eps));
+}
+
+export function biasGelu(x: Tensor, bias: Tensor): Tensor {
+    return new Tensor(native.biasGelu(x._id, bias._id));
 }
 
 export function layerNorm(x: Tensor, gamma: Tensor, beta: Tensor, eps: number = 1e-5): Tensor {

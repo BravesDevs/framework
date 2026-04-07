@@ -75,7 +75,7 @@ pub fn softmax(a: TensorId, dim: i32, store: &mut TensorStore, tape: &mut Tape) 
             .arg(&(dim_size as i32))
             .arg(&(inner as i32))
             .launch(LaunchConfig {
-                grid_dim: ((threads as u32 + 255) / 256, 1, 1),
+                grid_dim: (threads as u32, 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             })
@@ -133,7 +133,7 @@ pub fn softmax_backward(grad: TensorId, saved: &SavedContext, store: &mut Tensor
         let dim_size = shape[d];
         let outer: usize = shape[..d].iter().product::<usize>().max(1);
         let inner: usize = shape[d+1..].iter().product::<usize>().max(1);
-        let threads = outer * inner;
+        let rows = outer * inner;
 
         let dev = GpuDevice::instance();
         let grad_ptr = store.dev_ptr(grad);
@@ -150,7 +150,7 @@ pub fn softmax_backward(grad: TensorId, saved: &SavedContext, store: &mut Tensor
                 .arg(&(dim_size as i32))
                 .arg(&(inner as i32))
                 .launch(LaunchConfig {
-                    grid_dim: ((threads as u32 + 255) / 256, 1, 1),
+                    grid_dim: (rows as u32, 1, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })
@@ -251,7 +251,7 @@ pub fn layernorm(
             .arg(&(c as i32))
             .arg(&eps)
             .launch(LaunchConfig {
-                grid_dim: ((n as u32 + 255) / 256, 1, 1),
+                grid_dim: (n as u32, 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             })
@@ -363,7 +363,7 @@ pub fn layernorm_backward(grad: TensorId, saved: &SavedContext, store: &mut Tens
                 .arg(&(n as i32))
                 .arg(&(c as i32))
                 .launch(LaunchConfig {
-                    grid_dim: ((n as u32 + 255) / 256, 1, 1),
+                    grid_dim: (n as u32, 1, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })

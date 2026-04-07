@@ -1,4 +1,5 @@
 use smallvec::SmallVec;
+use crate::ops::data::IntStore;
 use crate::tensor::{TensorId, TensorStore};
 
 /// What was saved during forward for use in backward.
@@ -11,6 +12,12 @@ pub enum SavedContext {
     TensorsAndShape(SmallVec<[TensorId; 4]>, Vec<usize>),
     TensorAndShape(TensorId, Vec<usize>),
     Indices(Vec<usize>, usize, usize, TensorId), // indices, batch, seq_len, weight_id
+    GpuIndices(usize, usize, usize, TensorId),  // int_buf_id, dim1, dim2, aux_tensor_id
+    FlashAttention {
+        q: TensorId, k: TensorId, v: TensorId,
+        out: TensorId, lse: TensorId,
+        scale: f32, s: usize, d: usize, causal: bool,
+    },
     DropoutMask(TensorId, f32),
     Shape(Vec<usize>),
     Permutation(Vec<usize>, Vec<usize>), // order, original_shape
@@ -39,6 +46,11 @@ pub enum BackwardOp {
     LayerNorm,
     Embedding,
     CrossEntropy,
+    EmbeddingGpu,
+    CrossEntropyGpu,
+    FlashAttention,
+    ResidualLayerNorm,
+    BiasGelu,
     Dropout,
 }
 
@@ -74,7 +86,7 @@ impl Tape {
         }
     }
 
-    pub fn backward(self, loss_id: TensorId, store: &mut TensorStore) {
+    pub fn backward(self, loss_id: TensorId, store: &mut TensorStore, int_store: &IntStore) {
         use std::collections::{HashMap, HashSet};
 
         // Build adjacency: output -> entry index
@@ -133,7 +145,7 @@ impl Tape {
 
             if let Some(&entry_idx) = output_to_entry.get(tid) {
                 let entry = self.entries[entry_idx].clone();
-                let input_grads = dispatch_backward(&entry, grad_id, store);
+                let input_grads = dispatch_backward(&entry, grad_id, store, int_store);
 
                 for (inp_id, inp_grad) in entry.input_ids.iter().zip(input_grads) {
                     if let Some(ig) = inp_grad {
@@ -162,6 +174,7 @@ fn dispatch_backward(
     entry: &TapeEntry,
     grad_id: TensorId,
     store: &mut TensorStore,
+    int_store: &IntStore,
 ) -> Vec<Option<TensorId>> {
     use crate::ops;
     match entry.op {
@@ -185,6 +198,11 @@ fn dispatch_backward(
         BackwardOp::LayerNorm => ops::norm::layernorm_backward(grad_id, &entry.saved, store),
         BackwardOp::Embedding => ops::embedding::embedding_backward(grad_id, &entry.saved, store),
         BackwardOp::CrossEntropy => ops::loss::cross_entropy_backward(grad_id, &entry.saved, store),
+        BackwardOp::EmbeddingGpu => ops::embedding::embedding_backward_gpu(grad_id, &entry.saved, int_store, store),
+        BackwardOp::CrossEntropyGpu => ops::loss::cross_entropy_backward_gpu(grad_id, &entry.saved, int_store, store),
+        BackwardOp::FlashAttention => ops::attention::flash_attention_backward(grad_id, &entry.saved, store),
+        BackwardOp::ResidualLayerNorm => ops::fused::residual_layernorm_backward(grad_id, &entry.saved, store),
+        BackwardOp::BiasGelu => ops::fused::bias_gelu_backward(grad_id, &entry.saved, store),
         BackwardOp::Dropout => ops::dropout::dropout_backward(grad_id, &entry.saved, store),
     }
 }

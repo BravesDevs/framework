@@ -11,11 +11,13 @@ use parking_lot::Mutex;
 use std::sync::OnceLock;
 
 use crate::autograd::Tape;
+use crate::ops::data::IntStore;
 use crate::tensor::{TensorId, TensorStore};
 
 struct Engine {
     store: TensorStore,
     tape: Tape,
+    int_store: IntStore,
 }
 
 static ENGINE: OnceLock<Mutex<Engine>> = OnceLock::new();
@@ -25,6 +27,7 @@ fn engine() -> &'static Mutex<Engine> {
         Mutex::new(Engine {
             store: TensorStore::new(),
             tape: Tape::new(),
+            int_store: IntStore::new(),
         })
     })
 }
@@ -122,9 +125,9 @@ pub fn get_grad(id: u32) -> Option<u32> {
 #[napi]
 pub fn backward(loss_id: u32) {
     let mut eng = engine().lock();
-    let Engine { ref mut store, ref mut tape } = *eng;
+    let Engine { ref mut store, ref mut tape, ref int_store, .. } = *eng;
     let old_tape = std::mem::replace(tape, Tape::new());
-    old_tape.backward(loss_id as TensorId, store);
+    old_tape.backward(loss_id as TensorId, store, int_store);
 }
 
 #[napi]
@@ -343,6 +346,33 @@ pub fn clip_grad_norm(param_ids: Vec<u32>, max_norm: f64) {
     ops::optimizer::clip_grad_norm(&ids, max_norm as f32, &mut eng.store);
 }
 
+#[napi]
+pub fn clip_and_step(
+    param_ids: Vec<u32>,
+    lr: f64, beta1: f64, beta2: f64, eps: f64, weight_decay: f64,
+    step: i64, max_grad_norm: f64,
+) -> f64 {
+    let mut eng = engine().lock();
+    let ids: Vec<TensorId> = param_ids.iter().map(|&id| id as TensorId).collect();
+    ops::optimizer::clip_and_step(
+        &ids,
+        lr as f32, beta1 as f32, beta2 as f32, eps as f32, weight_decay as f32,
+        step as u32, max_grad_norm as f32,
+        &mut eng.store,
+    ) as f64
+}
+
+// ---------------------------------------------------------------------------
+// Mixed precision (GradScaler support)
+// ---------------------------------------------------------------------------
+
+#[napi]
+pub fn scale_grads(param_ids: Vec<u32>, inv_scale: f64) -> bool {
+    let mut eng = engine().lock();
+    let ids: Vec<TensorId> = param_ids.iter().map(|&id| id as TensorId).collect();
+    ops::mixed_precision::scale_grads(&ids, inv_scale as f32, &mut eng.store)
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -352,6 +382,89 @@ pub fn reset_engine() {
     let mut eng = engine().lock();
     eng.store = TensorStore::new();
     eng.tape = Tape::new();
+    eng.int_store = IntStore::new();
+}
+
+// ---------------------------------------------------------------------------
+// GPU data pipeline (i32 tensors for indices/targets)
+// ---------------------------------------------------------------------------
+
+#[napi]
+pub fn create_dataset(data: Int32Array) -> u32 {
+    let mut eng = engine().lock();
+    ops::data::create_dataset(data.as_ref(), &mut eng.int_store) as u32
+}
+
+#[napi]
+pub fn sample_batch(dataset_id: u32, block_size: i64, batch_size: i64) -> Vec<u32> {
+    let mut eng = engine().lock();
+    let (inp, tgt) = ops::data::sample_batch(
+        dataset_id as usize, block_size as usize, batch_size as usize,
+        &mut eng.int_store,
+    );
+    vec![inp as u32, tgt as u32]
+}
+
+#[napi]
+pub fn free_int_buffer(id: u32) {
+    let mut eng = engine().lock();
+    eng.int_store.free(id as usize);
+}
+
+#[napi]
+pub fn embedding_forward_gpu(weight: u32, int_buf_id: u32, batch: i64, seq_len: i64) -> u32 {
+    let mut e = engine().lock();
+    let Engine { store, tape, int_store, .. } = &mut *e;
+    ops::embedding::embedding_forward_gpu(
+        weight as TensorId,
+        int_buf_id as usize,
+        batch as usize,
+        seq_len as usize,
+        int_store, store, tape,
+    ) as u32
+}
+
+#[napi]
+pub fn residual_layernorm(x: u32, residual: u32, gamma: u32, beta: u32, eps: f64) -> u32 {
+    let mut eng = engine().lock();
+    let Engine { store, tape, .. } = &mut *eng;
+    ops::fused::residual_layernorm(
+        x as TensorId, residual as TensorId,
+        gamma as TensorId, beta as TensorId, eps as f32,
+        store, tape,
+    ) as u32
+}
+
+#[napi]
+pub fn bias_gelu(x: u32, bias: u32) -> u32 {
+    let mut eng = engine().lock();
+    let Engine { store, tape, .. } = &mut *eng;
+    ops::fused::bias_gelu(x as TensorId, bias as TensorId, store, tape) as u32
+}
+
+#[napi]
+pub fn flash_attention(q: u32, k: u32, v: u32, scale: f64, causal: bool) -> u32 {
+    let mut eng = engine().lock();
+    let Engine { store, tape, .. } = &mut *eng;
+    ops::attention::flash_attention(
+        q as TensorId, k as TensorId, v as TensorId,
+        scale as f32, causal, store, tape,
+    ) as u32
+}
+
+#[napi]
+pub fn cross_entropy_loss_gpu(logits: u32, int_buf_id: u32) -> u32 {
+    let mut e = engine().lock();
+    let Engine { store, tape, int_store, .. } = &mut *e;
+    let shape = store.shape(logits as TensorId).to_vec();
+    let v = shape[shape.len() - 1];
+    let bt = store.size(logits as TensorId) / v;
+    let flat_logits_id = ops::layout::view(logits as TensorId, &[bt, v], store, tape);
+    ops::loss::cross_entropy_gpu(
+        flat_logits_id,
+        int_buf_id as usize,
+        int_store, store, tape,
+    ) as u32
 }
 
 #[napi]

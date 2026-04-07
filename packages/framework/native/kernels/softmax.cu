@@ -1,47 +1,78 @@
+#define BLOCK_DIM 256
+
 extern "C" __global__
 void softmax_forward_f32(float* out, const float* x, int outer, int dim_size, int inner) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x;
     int total = outer * inner;
-    if (idx >= total) return;
+    if (row >= total) return;
 
-    int o = idx / inner;
-    int j = idx % inner;
+    int tid = threadIdx.x;
+    int o = row / inner;
+    int j = row % inner;
 
-    float max_val = x[o * dim_size * inner + j];
-    for (int d = 1; d < dim_size; d++) {
+    __shared__ float sdata[BLOCK_DIM];
+
+    float local_max = -INFINITY;
+    for (int d = tid; d < dim_size; d += blockDim.x) {
         float v = x[(o * dim_size + d) * inner + j];
-        if (v > max_val) max_val = v;
+        if (v > local_max) local_max = v;
     }
+    sdata[tid] = local_max;
+    __syncthreads();
 
-    float sum = 0.0f;
-    for (int d = 0; d < dim_size; d++) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float max_val = sdata[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int d = tid; d < dim_size; d += blockDim.x) {
         float e = expf(x[(o * dim_size + d) * inner + j] - max_val);
         out[(o * dim_size + d) * inner + j] = e;
-        sum += e;
+        local_sum += e;
     }
+    sdata[tid] = local_sum;
+    __syncthreads();
 
-    float inv_sum = 1.0f / sum;
-    for (int d = 0; d < dim_size; d++) {
-        out[(o * dim_size + d) * inner + j] *= inv_sum;
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
     }
+    float inv_sum = 1.0f / sdata[0];
+
+    for (int d = tid; d < dim_size; d += blockDim.x)
+        out[(o * dim_size + d) * inner + j] *= inv_sum;
 }
 
 extern "C" __global__
 void softmax_backward_f32(float* dx, const float* dy, const float* out, int outer, int dim_size, int inner) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x;
     int total = outer * inner;
-    if (idx >= total) return;
+    if (row >= total) return;
 
-    int o = idx / inner;
-    int j = idx % inner;
+    int tid = threadIdx.x;
+    int o = row / inner;
+    int j = row % inner;
 
-    float dot = 0.0f;
-    for (int d = 0; d < dim_size; d++) {
+    __shared__ float sdata[BLOCK_DIM];
+
+    float local_dot = 0.0f;
+    for (int d = tid; d < dim_size; d += blockDim.x) {
         int pos = (o * dim_size + d) * inner + j;
-        dot += dy[pos] * out[pos];
+        local_dot += dy[pos] * out[pos];
     }
+    sdata[tid] = local_dot;
+    __syncthreads();
 
-    for (int d = 0; d < dim_size; d++) {
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float dot = sdata[0];
+
+    for (int d = tid; d < dim_size; d += blockDim.x) {
         int pos = (o * dim_size + d) * inner + j;
         dx[pos] = out[pos] * (dy[pos] - dot);
     }
