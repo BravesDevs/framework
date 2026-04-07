@@ -206,10 +206,12 @@ jobs:
           done
 
       - name: Build and publish main package
-        working-directory: packages/framework
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
         run: |
+          cd packages/framework
+
           # Update version
           node -e "
             const pkg = require('./package.json');
@@ -220,6 +222,12 @@ jobs:
             require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
 
+          # Move root package.json to avoid workspace resolution
+          cd "$GITHUB_WORKSPACE"
+          mv package.json _package.json.bak
+          cd packages/framework
           npm install
           npx tsc
           npm publish --provenance --access public
+          cd "$GITHUB_WORKSPACE"
+          mv _package.json.bak package.json
