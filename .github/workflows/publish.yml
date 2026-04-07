@@ -134,10 +134,10 @@ jobs:
           name: ${{ matrix.artifact }}
           path: packages/framework/native/
 
-      - name: Build TypeScript
+      - name: Install dependencies and build TypeScript
         working-directory: packages/framework
         run: |
-          npm install
+          npm install --install-strategy=nested --ignore-scripts typescript @types/node
           npx tsc
 
       - name: Run tests
@@ -216,6 +216,6 @@ jobs:
             require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
 
-          npm install
+          npm install --install-strategy=nested --ignore-scripts typescript @types/node
           npx tsc
           npm publish --provenance --access public

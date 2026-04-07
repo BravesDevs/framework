@@ -150,10 +150,10 @@ jobs:
         shell: bash
         run: ls -lh *.node
 
-      - name: Build TypeScript
+      - name: Install dependencies and build TypeScript
         working-directory: packages/framework
         run: |
-          npm install
+          npm install --install-strategy=nested --ignore-scripts typescript @types/node
           npx tsc
 
       - name: Run tests
