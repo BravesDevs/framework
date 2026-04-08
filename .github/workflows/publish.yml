@@ -18,6 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ── CPU builds ──
           - target: x86_64-apple-darwin
             os: macos-14
             suffix: darwin-x64
@@ -49,6 +50,31 @@ jobs:
             lib_ext: dll
             feature: cpu
 
+          # ── WebGPU builds ──
+          - target: aarch64-apple-darwin
+            os: macos-14
+            suffix: darwin-arm64-webgpu
+            lib_ext: dylib
+            feature: webgpu
+
+          - target: x86_64-apple-darwin
+            os: macos-14
+            suffix: darwin-x64-webgpu
+            lib_ext: dylib
+            feature: webgpu
+
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            suffix: linux-x64-gnu-webgpu
+            lib_ext: so
+            feature: webgpu
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            suffix: win32-x64-msvc-webgpu
+            lib_ext: dll
+            feature: webgpu
+
     runs-on: ${{ matrix.os }}
     name: Build ${{ matrix.suffix }}
 
@@ -66,6 +92,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
+      - name: Install Vulkan SDK (Linux WebGPU)
+        if: matrix.feature == 'webgpu' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -73,8 +105,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             src/native/target
-          key: cargo-${{ matrix.target }}-${{ hashFiles('src/native/Cargo.lock') }}
-          restore-keys: cargo-${{ matrix.target }}-
+          key: cargo-${{ matrix.target }}-${{ matrix.feature }}-${{ hashFiles('src/native/Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-${{ matrix.feature }}-
 
       - name: Build native addon
         working-directory: src/native
@@ -130,6 +162,53 @@ jobs:
           path: npm/linux-x64-gnu-cuda/
           if-no-files-found: error
 
+  build-cuda-windows:
+    runs-on: windows-latest
+    name: Build win32-x64-msvc-cuda
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        with:
+          cuda: '12.6.3'
+          method: 'network'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/native/target
+          key: cargo-x86_64-pc-windows-msvc-cuda-${{ hashFiles('src/native/Cargo.lock') }}
+          restore-keys: cargo-x86_64-pc-windows-msvc-cuda-
+
+      - name: Build CUDA addon
+        working-directory: src/native
+        shell: bash
+        run: cargo build --release --target x86_64-pc-windows-msvc --no-default-features --features cuda
+
+      - name: Copy binary
+        shell: bash
+        run: |
+          cp src/native/target/x86_64-pc-windows-msvc/release/mni_framework_native.dll npm/win32-x64-msvc-cuda/mni-framework-native.win32-x64-msvc-cuda.node
+          ls -lh npm/win32-x64-msvc-cuda/mni-framework-native.win32-x64-msvc-cuda.node
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-win32-x64-msvc-cuda
+          path: npm/win32-x64-msvc-cuda/
+          if-no-files-found: error
+
   test:
     needs: build
     strategy:
@@ -173,7 +252,7 @@ jobs:
         run: node test/ops.test.js
 
   publish:
-    needs: [test, build-cuda]
+    needs: [test, build-cuda, build-cuda-windows]
     runs-on: ubuntu-latest
     name: Publish packages
 
@@ -197,7 +276,7 @@ jobs:
 
       - name: Prepare platform packages
         run: |
-          for suffix in darwin-arm64 darwin-x64 linux-x64-gnu linux-x64-gnu-cuda linux-arm64-gnu win32-x64-msvc; do
+          for suffix in darwin-arm64 darwin-arm64-webgpu darwin-x64 darwin-x64-webgpu linux-arm64-gnu linux-x64-gnu linux-x64-gnu-cuda linux-x64-gnu-webgpu win32-x64-msvc win32-x64-msvc-cuda win32-x64-msvc-webgpu; do
             PKG_DIR="npm/$suffix"
             cp artifacts/native-$suffix/mni-framework-native.*.node "$PKG_DIR/" 2>/dev/null || true
 
@@ -216,7 +295,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          for suffix in darwin-arm64 darwin-x64 linux-x64-gnu linux-x64-gnu-cuda linux-arm64-gnu win32-x64-msvc; do
+          for suffix in darwin-arm64 darwin-arm64-webgpu darwin-x64 darwin-x64-webgpu linux-arm64-gnu linux-x64-gnu linux-x64-gnu-cuda linux-x64-gnu-webgpu win32-x64-msvc win32-x64-msvc-cuda win32-x64-msvc-webgpu; do
             PKG_DIR="npm/$suffix"
             if ls "$PKG_DIR"/mni-framework-native.*.node 1>/dev/null 2>&1; then
               echo "Publishing @mni-ml/framework-$suffix..."

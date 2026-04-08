@@ -37,11 +37,16 @@
   ],
   "optionalDependencies": {
     "@mni-ml/framework-darwin-arm64": "0.3.0",
+    "@mni-ml/framework-darwin-arm64-webgpu": "0.3.0",
     "@mni-ml/framework-darwin-x64": "0.3.0",
+    "@mni-ml/framework-darwin-x64-webgpu": "0.3.0",
+    "@mni-ml/framework-linux-arm64-gnu": "0.3.0",
     "@mni-ml/framework-linux-x64-gnu": "0.3.0",
     "@mni-ml/framework-linux-x64-gnu-cuda": "0.3.0",
-    "@mni-ml/framework-linux-arm64-gnu": "0.3.0",
-    "@mni-ml/framework-win32-x64-msvc": "0.3.0"
+    "@mni-ml/framework-linux-x64-gnu-webgpu": "0.3.0",
+    "@mni-ml/framework-win32-x64-msvc": "0.3.0",
+    "@mni-ml/framework-win32-x64-msvc-cuda": "0.3.0",
+    "@mni-ml/framework-win32-x64-msvc-webgpu": "0.3.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

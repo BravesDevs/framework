@@ -6,39 +6,56 @@ import { fileURLToPath } from 'node:url';
 const __dirname_f = dirname(fileURLToPath(import.meta.url));
 
 // Check whether CUDA drivers are available on this system.
-// The CUDA native binary will abort the process on load if libcuda.so is missing,
+// The CUDA native binary will abort the process on load if the driver library is missing,
 // so we must check before attempting require().
 function hasCudaDriver(): boolean {
-    if (process.platform !== 'linux') return false;
-    const searchPaths = [
-        '/usr/lib/x86_64-linux-gnu',
-        '/usr/lib64',
-        '/usr/local/cuda/lib64',
-        '/usr/local/cuda/targets/x86_64-linux/lib',
-        '/usr/lib',
-    ];
-    const ldPath = process.env['LD_LIBRARY_PATH'] ?? '';
-    if (ldPath) searchPaths.push(...ldPath.split(':').filter(Boolean));
-    for (const dir of searchPaths) {
-        if (existsSync(join(dir, 'libcuda.so')) || existsSync(join(dir, 'libcuda.so.1'))) {
-            return true;
+    if (process.platform === 'linux') {
+        const searchPaths = [
+            '/usr/lib/x86_64-linux-gnu',
+            '/usr/lib64',
+            '/usr/local/cuda/lib64',
+            '/usr/local/cuda/targets/x86_64-linux/lib',
+            '/usr/lib',
+        ];
+        const ldPath = process.env['LD_LIBRARY_PATH'] ?? '';
+        if (ldPath) searchPaths.push(...ldPath.split(':').filter(Boolean));
+        for (const dir of searchPaths) {
+            if (existsSync(join(dir, 'libcuda.so')) || existsSync(join(dir, 'libcuda.so.1'))) {
+                return true;
+            }
         }
+        return false;
+    }
+    if (process.platform === 'win32') {
+        const system32 = join(process.env['SystemRoot'] ?? 'C:\\Windows', 'System32');
+        if (existsSync(join(system32, 'nvcuda.dll'))) return true;
+        const pathDirs = (process.env['PATH'] ?? '').split(';').filter(Boolean);
+        for (const dir of pathDirs) {
+            if (existsSync(join(dir, 'nvcuda.dll'))) return true;
+        }
+        return false;
     }
     return false;
 }
 
-// Order matters: GPU packages are tried first, then CPU fallback.
-// CUDA entries are only included when a CUDA driver is detected.
+// Priority: CUDA (if driver detected) > WebGPU > CPU.
+// CUDA entries are only included when a CUDA driver is detected to prevent process abort.
 function getPlatformPackages(): Record<string, string[]> {
     const cuda = hasCudaDriver();
     return {
         'darwin-arm64':  ['@mni-ml/framework-darwin-arm64-webgpu', '@mni-ml/framework-darwin-arm64'],
         'darwin-x64':    ['@mni-ml/framework-darwin-x64-webgpu',   '@mni-ml/framework-darwin-x64'],
-        'linux-x64':     cuda
-            ? ['@mni-ml/framework-linux-x64-gnu-cuda', '@mni-ml/framework-linux-x64-gnu']
-            : ['@mni-ml/framework-linux-x64-gnu'],
+        'linux-x64':     [
+            ...(cuda ? ['@mni-ml/framework-linux-x64-gnu-cuda'] : []),
+            '@mni-ml/framework-linux-x64-gnu-webgpu',
+            '@mni-ml/framework-linux-x64-gnu',
+        ],
         'linux-arm64':   ['@mni-ml/framework-linux-arm64-gnu'],
-        'win32-x64':     ['@mni-ml/framework-win32-x64-msvc-webgpu', '@mni-ml/framework-win32-x64-msvc'],
+        'win32-x64':     [
+            ...(cuda ? ['@mni-ml/framework-win32-x64-msvc-cuda'] : []),
+            '@mni-ml/framework-win32-x64-msvc-webgpu',
+            '@mni-ml/framework-win32-x64-msvc',
+        ],
     };
 }
 
@@ -47,11 +64,17 @@ function getLocalSuffixes(): Record<string, string[]> {
     return {
         'darwin-arm64': ['darwin-arm64-webgpu', 'darwin-arm64'],
         'darwin-x64':   ['darwin-x64-webgpu',   'darwin-x64'],
-        'linux-x64':    cuda
-            ? ['linux-x64-gnu-cuda', 'linux-x64-gnu']
-            : ['linux-x64-gnu'],
+        'linux-x64':    [
+            ...(cuda ? ['linux-x64-gnu-cuda'] : []),
+            'linux-x64-gnu-webgpu',
+            'linux-x64-gnu',
+        ],
         'linux-arm64':  ['linux-arm64-gnu'],
-        'win32-x64':    ['win32-x64-msvc-webgpu', 'win32-x64-msvc'],
+        'win32-x64':    [
+            ...(cuda ? ['win32-x64-msvc-cuda'] : []),
+            'win32-x64-msvc-webgpu',
+            'win32-x64-msvc',
+        ],
     };
 }
 
