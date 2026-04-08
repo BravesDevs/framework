@@ -17,16 +17,6 @@ A TypeScript ML framework with Rust native backends (CPU, CUDA, WebGPU) providin
 npm install @mni-ml/framework
 ```
 
-Prebuilt native binaries are installed automatically for your platform. The loader picks the best available backend: **CUDA > WebGPU > CPU**.
-
-| Platform | CPU | CUDA | WebGPU |
-|----------|-----|------|--------|
-| macOS Apple Silicon | yes | — | yes (Metal) |
-| macOS Intel | yes | — | yes (Metal) |
-| Linux x64 | yes | yes | yes (Vulkan) |
-| Linux ARM64 | yes | — | — |
-| Windows x64 | yes | yes | yes (DX12) |
-
 ## Quick Start
 
 ```typescript
