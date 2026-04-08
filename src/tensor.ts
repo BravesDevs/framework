@@ -5,12 +5,13 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname_f = dirname(fileURLToPath(import.meta.url));
 
+// Order matters: GPU packages are tried first, then CPU fallback.
 const PLATFORM_PACKAGES: Record<string, string[]> = {
-    'darwin-arm64':  ['@mni-ml/framework-darwin-arm64'],
-    'darwin-x64':    ['@mni-ml/framework-darwin-x64'],
-    'linux-x64':     ['@mni-ml/framework-linux-x64-gnu-cuda', '@mni-ml/framework-linux-x64-gnu'],
+    'darwin-arm64':  ['@mni-ml/framework-darwin-arm64-webgpu', '@mni-ml/framework-darwin-arm64'],
+    'darwin-x64':    ['@mni-ml/framework-darwin-x64-webgpu',   '@mni-ml/framework-darwin-x64'],
+    'linux-x64':     ['@mni-ml/framework-linux-x64-gnu-cuda',  '@mni-ml/framework-linux-x64-gnu'],
     'linux-arm64':   ['@mni-ml/framework-linux-arm64-gnu'],
-    'win32-x64':     ['@mni-ml/framework-win32-x64-msvc'],
+    'win32-x64':     ['@mni-ml/framework-win32-x64-msvc-webgpu', '@mni-ml/framework-win32-x64-msvc'],
 };
 
 function loadNative() {
@@ -26,12 +27,13 @@ function loadNative() {
     }
 
     // 2. Fall back to a local .node file (dev builds / build-from-source)
+    //    GPU binaries are tried first, then CPU fallback.
     const suffixMap: Record<string, string[]> = {
-        'darwin-arm64': ['darwin-arm64'],
-        'darwin-x64':   ['darwin-x64'],
-        'linux-x64':    ['linux-x64-gnu-cuda', 'linux-x64-gnu'],
+        'darwin-arm64': ['darwin-arm64-webgpu', 'darwin-arm64'],
+        'darwin-x64':   ['darwin-x64-webgpu',   'darwin-x64'],
+        'linux-x64':    ['linux-x64-gnu-cuda',  'linux-x64-gnu'],
         'linux-arm64':  ['linux-arm64-gnu'],
-        'win32-x64':    ['win32-x64-msvc'],
+        'win32-x64':    ['win32-x64-msvc-webgpu', 'win32-x64-msvc'],
     };
     const suffixes = suffixMap[key] ?? [key];
     const ext = platform === 'win32' ? 'dll' : platform === 'darwin' ? 'dylib' : 'so';
